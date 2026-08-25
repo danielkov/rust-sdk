@@ -4,6 +4,9 @@
 
 ### Added
 
+- *(unstable-v2)* Expose pending session injection through the
+  `unstable_session_inject` feature, including typed JSON-RPC dispatch and
+  `V2Session` helpers to inject, replace, and revoke typed content.
 - Add a default-enabled `schemars` feature that forwards JSON Schema support to
   the schema crate and gates the typed MCP tool helpers. Set
   `default-features = false` to use the core SDK without `schemars`; custom MCP
