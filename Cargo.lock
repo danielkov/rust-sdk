@@ -3,42 +3,15 @@
 version = 4
 
 [[package]]
-name = "agent-client-protocol"
-version = "2.2.0"
-dependencies = [
- "agent-client-protocol-derive",
- "agent-client-protocol-schema",
- "agent-client-protocol-test",
- "async-io",
- "async-process",
- "blocking",
- "clap",
- "expect-test",
- "futures",
- "futures-concurrency",
- "rustc-hash",
- "rustix",
- "schemars 1.2.2",
- "serde",
- "serde_json",
- "shell-words",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "agent-client-protocol-conductor"
 version = "2.2.0"
 dependencies = [
- "agent-client-protocol",
  "agent-client-protocol-polyfill",
  "agent-client-protocol-rmcp",
  "agent-client-protocol-test",
  "agent-client-protocol-trace-viewer",
  "agent-client-protocol-yopo",
+ "agentkit-acp-sdk",
  "anyhow",
  "chrono",
  "clap",
@@ -63,8 +36,8 @@ dependencies = [
 name = "agent-client-protocol-cookbook"
 version = "2.2.0"
 dependencies = [
- "agent-client-protocol",
  "agent-client-protocol-rmcp",
+ "agentkit-acp-sdk",
  "futures",
  "rmcp",
  "schemars 1.2.2",
@@ -81,33 +54,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-client-protocol-http"
-version = "2.2.0"
-dependencies = [
- "agent-client-protocol",
- "agent-client-protocol-test",
- "async-stream",
- "async-tungstenite",
- "axum",
- "eventsource-stream",
- "futures",
- "reqwest",
- "serde_json",
- "thiserror",
- "tokio",
- "tower",
- "tower-http 0.7.1",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "agent-client-protocol-polyfill"
 version = "2.2.0"
 dependencies = [
- "agent-client-protocol",
+ "agentkit-acp-sdk",
  "async-stream",
  "axum",
  "futures",
@@ -124,7 +74,7 @@ dependencies = [
 name = "agent-client-protocol-rmcp"
 version = "3.1.1"
 dependencies = [
- "agent-client-protocol",
+ "agentkit-acp-sdk",
  "futures",
  "futures-concurrency",
  "rmcp",
@@ -138,26 +88,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "agent-client-protocol-schema"
-version = "1.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d595a79e1665d02c91c7dd1bedd118501e75cc0a3d5b1651b5150ec4c5c1e0d"
-dependencies = [
- "anyhow",
- "derive_more",
- "schemars 1.2.2",
- "serde",
- "serde_json",
- "serde_with",
- "strum",
- "tracing",
-]
-
-[[package]]
 name = "agent-client-protocol-test"
 version = "0.11.0"
 dependencies = [
- "agent-client-protocol",
+ "agentkit-acp-sdk",
  "anyhow",
  "http",
  "rmcp",
@@ -187,11 +121,77 @@ dependencies = [
 name = "agent-client-protocol-yopo"
 version = "0.11.0"
 dependencies = [
- "agent-client-protocol",
+ "agentkit-acp-sdk",
  "clap",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "agentkit-acp-http"
+version = "2.2.0"
+dependencies = [
+ "agent-client-protocol-test",
+ "agentkit-acp-sdk",
+ "async-stream",
+ "async-tungstenite",
+ "axum",
+ "eventsource-stream",
+ "futures",
+ "reqwest",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http 0.7.1",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "agentkit-acp-schema"
+version = "1.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dfcb839ccca8f4f43bfc9aa26473396f16afbd32071efd00d36801daed62f9d7"
+dependencies = [
+ "anyhow",
+ "derive_more",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "strum",
+ "tracing",
+]
+
+[[package]]
+name = "agentkit-acp-sdk"
+version = "2.2.0"
+dependencies = [
+ "agent-client-protocol-derive",
+ "agent-client-protocol-test",
+ "agentkit-acp-schema",
+ "async-io",
+ "async-process",
+ "blocking",
+ "clap",
+ "expect-test",
+ "futures",
+ "futures-concurrency",
+ "rustc-hash",
+ "rustix",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "shell-words",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

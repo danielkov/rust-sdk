@@ -1,14 +1,17 @@
 [package]
-name = "agent-client-protocol"
+name = "agentkit-acp-sdk"
 version = "2.2.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-repository.workspace = true
-description = "Core protocol types and traits for the Agent Client Protocol"
+repository = "https://github.com/danielkov/rust-sdk"
+description = "Agent Client Protocol SDK fork used by agentkit, adding unstable v2 session injection, tracked response receipts and bounded transports"
 keywords = ["acp", "agent", "protocol", "ai"]
 categories = ["development-tools"]
+
+[lib]
+name = "agent_client_protocol"
 
 [package.metadata.docs.rs]
 all-features = true

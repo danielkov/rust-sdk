@@ -1,14 +1,17 @@
 [package]
-name = "agent-client-protocol-http"
+name = "agentkit-acp-http"
 version = "2.2.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-repository.workspace = true
-description = "HTTP and WebSocket transport for the Agent Client Protocol (ACP)"
+repository = "https://github.com/danielkov/rust-sdk"
+description = "Agent Client Protocol HTTP and WebSocket transport fork used by agentkit, adding bounded admission"
 keywords = ["acp", "agent", "protocol", "http", "websocket"]
 categories = ["development-tools", "web-programming::http-server"]
+
+[lib]
+name = "agent_client_protocol_http"
 
 [package.metadata.docs.rs]
 all-features = true
