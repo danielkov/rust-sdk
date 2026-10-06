@@ -636,6 +636,143 @@ mod tests {
 
     const INITIALIZED: &str = r#"{"jsonrpc":"2.0","id":0,"result":{}}"#;
 
+    async fn burst_fixture() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Router, body::Body, response::Response, routing::post};
+        // A single ready body must not monopolize the driver poll. Keep the
+        // stream open afterwards so EOF cannot mask admission failures.
+        let events = (0..1000)
+            .map(|index| format!("data: {{\"jsonrpc\":\"2.0\",\"method\":\"update\",\"params\":{{\"index\":{index}}}}}\n\n"))
+            .collect::<String>();
+        let app = Router::new().route(
+            "/acp",
+            post(|| async {
+                Response::builder()
+                    .header(HEADER_CONNECTION_ID, "burst-test")
+                    .body(Body::from(INITIALIZED))
+                    .unwrap()
+            })
+            .get(move || {
+                let events = events.clone();
+                async move {
+                    let body =
+                        futures::stream::once(
+                            async move { Ok::<_, std::convert::Infallible>(events) },
+                        )
+                        .chain(futures::stream::pending());
+                    Response::builder()
+                        .header("Content-Type", "text/event-stream")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            })
+            .delete(|| async { axum::http::StatusCode::NO_CONTENT }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/acp"), server)
+    }
+
+    fn burst_limits() -> HttpClientLimits {
+        HttpClientLimits {
+            channel: ChannelLimits {
+                max_buffered_frames: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_sse_burst_yields_to_consumer_and_closes() {
+        let (url, server) = burst_fixture().await;
+        let (mut channel, mut transport) = HttpClient::with_endpoint(url)
+            .unwrap()
+            .with_limits(burst_limits())
+            .unwrap()
+            .into_bounded_channel_and_future();
+        channel.tx.try_send(initialize()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for index in 0..=1000 {
+                // Poll driver first, matching a stdio relay sharing one task.
+                match futures::future::select(&mut transport, channel.rx.next()).await {
+                    futures::future::Either::Left((result, _)) => {
+                        panic!("burst driver exited: {result:?}")
+                    }
+                    futures::future::Either::Right((frame, _)) => {
+                        let Some(frame) = frame else {
+                            panic!("burst channel closed: {:?}", (&mut transport).await);
+                        };
+                        let value: serde_json::Value =
+                            serde_json::from_slice(frame.as_bytes()).unwrap();
+                        if index == 0 {
+                            assert_eq!(value["id"], 0);
+                        } else {
+                            assert_eq!(value["params"]["index"], index - 1);
+                        }
+                    }
+                }
+            }
+            channel.tx.close_channel();
+            transport.await.unwrap();
+            assert!(channel.rx.next().await.is_none());
+        })
+        .await
+        .expect("burst replay or shutdown stalled");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ready_sse_burst_still_fails_closed_for_stalled_consumer() {
+        let (url, server) = burst_fixture().await;
+        let (channel, transport) = HttpClient::with_endpoint(url)
+            .unwrap()
+            .with_limits(burst_limits())
+            .unwrap()
+            .into_bounded_channel_and_future();
+        channel.tx.try_send(initialize()).unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), transport)
+            .await
+            .expect("stalled consumer did not exhaust admission")
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("bounded channel frame/byte admission exhausted"),
+            "{error:?}"
+        );
+        assert!(channel.tx.try_send(initialize()).is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ready_sse_burst_can_be_cancelled() {
+        let (url, server) = burst_fixture().await;
+        let (mut channel, mut transport) = HttpClient::with_endpoint(url)
+            .unwrap()
+            .with_limits(burst_limits())
+            .unwrap()
+            .into_bounded_channel_and_future();
+        channel.tx.try_send(initialize()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for _ in 0..3 {
+                match futures::future::select(&mut transport, channel.rx.next()).await {
+                    futures::future::Either::Left((result, _)) => {
+                        panic!("burst driver exited: {result:?}")
+                    }
+                    futures::future::Either::Right((frame, _)) => {
+                        if frame.is_none() {
+                            panic!("burst channel closed: {:?}", (&mut transport).await);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(transport);
+        assert!(channel.tx.try_send(initialize()).is_err());
+        server.abort();
+    }
+
     #[tokio::test]
     async fn graceful_eof_waits_for_delete_headers_not_body() {
         let (url, started, release, server) = teardown_fixture(INITIALIZED).await;
@@ -1538,10 +1675,29 @@ async fn run_bounded_inner(
                     }
                     incoming.try_send(frame)?;
                     streams.futures.push(stream.next());
+                    // A ready SSE body can contain more frames than incoming
+                    // admission allows. Let the consumer drain between frames
+                    // even when the driver and consumer share one task. Real
+                    // overload still fails closed at the next admission.
+                    yield_once().await;
                 }
             },
         }
     }
+}
+
+async fn yield_once() {
+    let mut yielded = false;
+    futures::future::poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
 }
 
 struct Sse {
@@ -1626,17 +1782,7 @@ impl Sse {
                     if work == 8192 {
                         // Cooperative yielding even for a continuously ready
                         // comment-only stream, without a spawned observer task.
-                        let mut yielded = false;
-                        futures::future::poll_fn(|cx| {
-                            if yielded {
-                                Poll::Ready(())
-                            } else {
-                                yielded = true;
-                                cx.waker().wake_by_ref();
-                                Poll::Pending
-                            }
-                        })
-                        .await;
+                        yield_once().await;
                         work = 0;
                     }
                 }
