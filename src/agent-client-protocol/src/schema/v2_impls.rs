@@ -373,12 +373,16 @@ impl_v2_jsonrpc_notification_enum!(v2::ClientNotification {
 impl_v2_jsonrpc_request_enum!(v2::AgentRequest {
     RequestPermissionRequest => "session/request_permission",
     CreateElicitationRequest => "elicitation/create",
+    #[cfg(feature = "unstable_mcp_over_acp")]
+    MessageMcpRequest => "mcp/message",
     [ext] ExtMethodRequest,
 });
 
 impl_v2_jsonrpc_response_enum!(v2::ClientResponse {
     RequestPermissionResponse => "session/request_permission",
     CreateElicitationResponse => "elicitation/create",
+    #[cfg(feature = "unstable_mcp_over_acp")]
+    MessageMcpResponse => "mcp/message",
     [ext] ExtMethodResponse,
 });
 
