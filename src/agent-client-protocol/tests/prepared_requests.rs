@@ -385,11 +385,13 @@ async fn cancellation_handles_share_once_only_state_with_sent_request_and_drop()
         notifications: _,
         mut peer,
     } = external_connection();
+    let (published_tx, published_rx) = oneshot::channel();
     let caller = async move {
         let connection = connection_rx.await.unwrap();
         let request = connection.send_request(UntypedMessage::new("pending", json!({})).unwrap());
         let cancellation: RequestCancellationHandle = request.cancellation_handle();
         let cloned_cancellation = cancellation.clone();
+        published_rx.await.unwrap();
         cancellation.cancel().unwrap();
         request.cancel().unwrap();
         cloned_cancellation.cancel().unwrap();
@@ -410,6 +412,7 @@ async fn cancellation_handles_share_once_only_state_with_sent_request_and_drop()
             panic!("expected the pending request");
         };
         assert_eq!(request.method.as_ref(), "pending");
+        published_tx.send(()).unwrap();
         let Some(TransportFrame::Single(RawJsonRpcMessage::Notification(cancellation))) =
             peer.rx.next().await
         else {
