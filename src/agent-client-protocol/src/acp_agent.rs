@@ -14,7 +14,7 @@ use async_process::Child;
 use serde::{Deserialize, Serialize};
 use std::pin::pin;
 
-use crate::{Client, Conductor, Role};
+use crate::{Client, Conductor, LineDirection, Role};
 
 type DebugCallback = Arc<dyn Fn(&str, LineDirection) + Send + Sync + 'static>;
 
@@ -23,21 +23,14 @@ const STDERR_READ_BUFFER_SIZE: usize = 8 * 1024;
 const STDERR_LINE_TRUNCATION_MARKER: &str = "… [stderr line truncated]";
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(1);
 
-/// Direction of a line being sent or received.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LineDirection {
-    /// Line being sent to the agent (stdin)
-    Stdin,
-    /// Line being received from the agent (stdout)
-    Stdout,
-    /// Line being received from the agent (stderr)
-    Stderr,
-}
-
 /// Configuration for launching an ACP agent subprocess.
 ///
 /// This is local SDK configuration, not an ACP wire-protocol type. It contains
 /// only the values used to launch the child process.
+///
+/// This non-exhaustive type is constructed with [`Self::new`] and customized
+/// with its fluent methods. A command is required, so there is no `Default`
+/// configuration. Its JSON representation is unchanged by non-exhaustiveness.
 ///
 /// ```
 /// use agent_client_protocol::{AcpAgent, AcpAgentConfig};
@@ -50,6 +43,7 @@ pub enum LineDirection {
 /// ```
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[non_exhaustive]
 pub struct AcpAgentConfig {
     command: PathBuf,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1344,7 +1338,7 @@ mod tests {
 
     #[cfg(unix)]
     async fn reported_descendant_pid(
-        connection: &mut futures::future::BoxFuture<'static, Result<(), crate::Error>>,
+        connection: &mut (impl Future<Output = Result<(), crate::Error>> + Unpin),
         pid_rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
     ) -> rustix::process::Pid {
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1406,7 +1400,8 @@ mod tests {
         let (agent, mut pid_rx) = wrapper_agent(
             "echo ACP_TEST_CHILD_PID=$$ >&2; exec 1>&-; sleep 30 & child=$!; wait \"$child\"",
         );
-        let (channel, mut connection) = crate::ConnectTo::<Client>::into_channel_and_future(agent);
+        let (channel, connection) = crate::ConnectTo::<Client>::into_channel_and_future(agent);
+        let mut connection = connection.expect("AcpAgent owns its process connection");
         let crate::Channel {
             rx: _incoming,
             tx: outgoing,
@@ -1448,7 +1443,8 @@ mod tests {
         let (agent, mut pid_rx) = wrapper_agent(
             "sleep 30 & child=$!; echo ACP_TEST_CHILD_PID=$child >&2; wait \"$child\"",
         );
-        let (_channel, mut connection) = crate::ConnectTo::<Client>::into_channel_and_future(agent);
+        let (_channel, connection) = crate::ConnectTo::<Client>::into_channel_and_future(agent);
+        let mut connection = connection.expect("AcpAgent owns its process connection");
         let descendant_pid = reported_descendant_pid(&mut connection, &mut pid_rx).await;
         let mut cleanup = KillOnDrop(Some(descendant_pid));
 
@@ -1464,7 +1460,8 @@ mod tests {
         let (agent, mut pid_rx) = wrapper_agent(
             "sh -c 'trap \"\" HUP; exec sleep 30' >/dev/null & child=$!; echo ACP_TEST_CHILD_PID=$child >&2; exit 17",
         );
-        let (_channel, mut connection) = crate::ConnectTo::<Client>::into_channel_and_future(agent);
+        let (_channel, connection) = crate::ConnectTo::<Client>::into_channel_and_future(agent);
+        let mut connection = connection.expect("AcpAgent owns its process connection");
         let descendant_pid = reported_descendant_pid(&mut connection, &mut pid_rx).await;
         let mut cleanup = KillOnDrop(Some(descendant_pid));
 
@@ -1590,7 +1587,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert!(config.arguments().is_empty());
+        assert_eq!(config.arguments(), &[] as &[String]);
         assert!(config.environment().is_empty());
         assert_eq!(
             serde_json::to_value(config).unwrap(),

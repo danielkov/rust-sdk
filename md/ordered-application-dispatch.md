@@ -8,7 +8,7 @@ on another task does not drain that application queue.
 Use **one FIFO queue with one sequential consumer** for:
 
 1. Notifications, enqueued by typed connection handlers.
-2. Response results, enqueued by `SentRequest::on_receiving_result`.
+2. Response results, enqueued by `PreparedRequest::on_receiving_result`.
 3. Connection closure, enqueued by `Builder::on_close`.
 
 Apply updates in the consumer and expose a response result only when the
@@ -25,11 +25,13 @@ machine or coordinator.
 
 ## Response barriers are short dispatch steps
 
-Register `on_receiving_result` immediately when sending the request, before
-yielding or transferring the request to another task. If registered before the
-response is routed in its original dispatch, the callback holds dispatch until
-it returns. The barrier is not retroactive: already-routed responses and later
-routing through a retained `ResponseRouter` do not hold subsequent wire traffic.
+Use `prepare_request(...).on_receiving_result(...)` to install ordered handling
+before publishing the request, even from another task. Eager
+`send_request(...).on_receiving_result(...)` only holds dispatch if registration
+wins the race with response routing. The barrier is not retroactive:
+already-routed responses and later routing through a retained `ResponseRouter`
+do not hold subsequent wire traffic. See [Sending Requests](./sending-requests.md)
+for the additive API and publication timing.
 
 The callback should enqueue the result and return. **Do not await another
 inbound response or notification on that connection inside the callback.**
@@ -59,7 +61,10 @@ enqueue results after the closure event. The application should settle its
 outstanding operations at `Closed` and tolerate late completions, rather than
 waiting for every callback before accepting closure. Transport and handler
 errors still propagate from the connection future; this pattern does not turn
-all failures into clean EOF.
+all failures into clean EOF. To run shared disconnect cleanup for every
+outcome, also observe `ConnectionTo::terminated()`. It reports why the driver
+stopped, but is not ordered with the application queue, so keep `on_close` as
+the projection barrier for clean EOF.
 
 ## Do not add prompt attribution
 

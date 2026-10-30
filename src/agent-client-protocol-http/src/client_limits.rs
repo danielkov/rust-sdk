@@ -140,26 +140,26 @@ impl BoundedHttpClient {
     /// Extract the charged channel without a legacy adapter. Poll the returned
     /// future to drive HTTP; dropping it cancels streams and POSTs. Connection
     /// cleanup is best effort, as described on [`BoundedHttpClient`].
-    #[must_use]
-    pub fn into_bounded_channel_and_future(
-        self,
-    ) -> (BoundedChannel, BoxFuture<'static, Result<(), AcpError>>) {
-        (
-            self.caller,
-            run_bounded(self.client, self.limits, self.transport).boxed(),
-        )
+    pub fn into_bounded_channel_and_future(self) -> (BoundedChannel, ConnectionDriver) {
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let driver = ConnectionDriver::with_finish(
+            run_bounded(self.client, self.limits, self.transport, finish_rx),
+            move || {
+                let _ = finish_tx.send(());
+            },
+        );
+        (self.caller, driver)
     }
 }
 
 impl ConnectTo<Client> for BoundedHttpClient {
     async fn connect_to(self, client: impl ConnectTo<Agent>) -> Result<(), AcpError> {
         let (channel, transport) = self.into_bounded_channel_and_future();
-        let shutdown = channel.tx.clone();
         let application = client.connect_to(channel).boxed();
         match futures::future::select(application, transport).await {
-            futures::future::Either::Left((result, transport)) => {
+            futures::future::Either::Left((result, mut transport)) => {
                 result?;
-                shutdown.close_channel();
+                assert!(transport.request_finish());
                 transport.await
             }
             futures::future::Either::Right((result, application)) => {
@@ -171,25 +171,24 @@ impl ConnectTo<Client> for BoundedHttpClient {
         }
     }
 
-    fn into_channel_and_future(self) -> (Channel, BoxFuture<'static, Result<(), AcpError>>) {
+    fn into_channel_and_future(self) -> (Channel, Option<ConnectionDriver>) {
         let (caller, other) = Channel::duplex();
         drop(other);
         drop(self);
         (
             caller,
-            async {
+            Some(ConnectionDriver::new(async {
                 Err(failure(
                     "legacy channel extraction is disabled; use bounded transport extraction",
                 ))
-            }
-            .boxed(),
+            })),
         )
     }
 
     fn into_bounded_channel_and_future(
         self,
         limits: ChannelLimits,
-    ) -> Result<(BoundedChannel, BoxFuture<'static, Result<(), AcpError>>), AcpError> {
+    ) -> Result<(BoundedChannel, Option<ConnectionDriver>), AcpError> {
         let limits = limits.validate()?;
         if self.limits.channel != limits {
             return Err(self
@@ -197,14 +196,13 @@ impl ConnectTo<Client> for BoundedHttpClient {
                 .tx
                 .fail("bounded HTTP client limits differ from requested limits"));
         }
-        Ok(BoundedHttpClient::into_bounded_channel_and_future(self))
+        let (channel, driver) = BoundedHttpClient::into_bounded_channel_and_future(self);
+        Ok((channel, Some(driver)))
     }
 
-    fn into_transport_and_future(
-        self,
-    ) -> (TransportChannel, BoxFuture<'static, Result<(), AcpError>>) {
+    fn into_transport_and_future(self) -> (TransportChannel, Option<ConnectionDriver>) {
         let (channel, future) = self.into_bounded_channel_and_future();
-        (TransportChannel::Bounded(channel), future)
+        (TransportChannel::Bounded(channel), Some(future))
     }
 }
 
@@ -449,6 +447,53 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn bounded_finish_drains_accepted_frames_and_revokes_escaped_sender() {
+        let (caller, transport) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
+        caller.tx.try_send(initialize()).unwrap();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let mut outgoing = finishable_bounded_outgoing(transport.rx, finish_rx);
+        finish_tx.send(()).unwrap();
+        assert!(outgoing.next().await.is_some());
+        assert!(caller.tx.try_send(initialize()).is_err());
+        assert!(outgoing.next().await.is_none());
+        assert!(caller.tx.failure().now_or_never().is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_finish_hook_does_not_own_producer_lifetime() {
+        let (caller, transport) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
+        let (_finish_tx, finish_rx) = oneshot::channel();
+        let mut outgoing = finishable_bounded_outgoing(transport.rx, finish_rx);
+        drop(caller.tx);
+        assert!(outgoing.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn dropped_bounded_finish_signal_does_not_seal_admission() {
+        let (caller, transport) = BoundedChannel::duplex(ChannelLimits::default()).unwrap();
+        let (finish_tx, finish_rx) = oneshot::channel();
+        let mut outgoing = finishable_bounded_outgoing(transport.rx, finish_rx);
+        drop(finish_tx);
+        assert!(outgoing.next().now_or_never().is_none());
+        caller.tx.try_send(initialize()).unwrap();
+        assert!(outgoing.next().await.is_some());
+        drop(caller.tx);
+        assert!(outgoing.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_driver_can_finish_without_initialization() {
+        let (channel, mut driver) = HttpClient::new("http://localhost")
+            .unwrap()
+            .with_limits(HttpClientLimits::default())
+            .unwrap()
+            .into_bounded_channel_and_future();
+        assert!(driver.request_finish());
+        driver.await.unwrap();
+        assert!(channel.tx.try_send(initialize()).is_err());
+    }
+
     #[test]
     fn bounded_extraction_validates_requested_limits() {
         let configured = ChannelLimits::default();
@@ -464,6 +509,7 @@ mod tests {
         let (channel, future) =
             ConnectTo::<Client>::into_bounded_channel_and_future(client(), configured).unwrap();
         assert_eq!(channel.limits(), configured);
+        assert!(future.is_some(), "HTTP owns its physical transport driver");
         drop((channel, future));
         let different = ChannelLimits {
             max_pending_requests: configured.max_pending_requests + 1,
@@ -635,6 +681,147 @@ mod tests {
     }
 
     const INITIALIZED: &str = r#"{"jsonrpc":"2.0","id":0,"result":{}}"#;
+
+    async fn burst_fixture() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{Router, body::Body, response::Response, routing::post};
+        // A single ready body must not monopolize the driver poll. Keep the
+        // stream open afterwards so EOF cannot mask admission failures.
+        use std::fmt::Write as _;
+        let mut events = String::new();
+        for index in 0..1000 {
+            write!(events, "data: {{\"jsonrpc\":\"2.0\",\"method\":\"update\",\"params\":{{\"index\":{index}}}}}\n\n").unwrap();
+        }
+        let app = Router::new().route(
+            "/acp",
+            post(|| async {
+                Response::builder()
+                    .header(HEADER_CONNECTION_ID, "burst-test")
+                    .body(Body::from(INITIALIZED))
+                    .unwrap()
+            })
+            .get(move || {
+                let events = events.clone();
+                async move {
+                    let body =
+                        futures::stream::once(
+                            async move { Ok::<_, std::convert::Infallible>(events) },
+                        )
+                        .chain(futures::stream::pending());
+                    Response::builder()
+                        .header("Content-Type", "text/event-stream")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            })
+            .delete(|| async { axum::http::StatusCode::NO_CONTENT }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{address}/acp"), server)
+    }
+
+    fn burst_limits() -> HttpClientLimits {
+        HttpClientLimits {
+            channel: ChannelLimits {
+                max_buffered_frames: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_sse_burst_yields_to_consumer_and_closes() {
+        let (url, server) = burst_fixture().await;
+        let (mut channel, mut transport) = HttpClient::with_endpoint(url)
+            .unwrap()
+            .with_limits(burst_limits())
+            .unwrap()
+            .into_bounded_channel_and_future();
+        channel.tx.try_send(initialize()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for index in 0..=1000 {
+                // Poll driver first, matching a stdio relay sharing one task.
+                match futures::future::select(&mut transport, channel.rx.next()).await {
+                    futures::future::Either::Left((result, _)) => {
+                        panic!("burst driver exited: {result:?}")
+                    }
+                    futures::future::Either::Right((frame, _)) => {
+                        let Some(frame) = frame else {
+                            panic!("burst channel closed: {:?}", (&mut transport).await);
+                        };
+                        let value: serde_json::Value =
+                            serde_json::from_slice(frame.as_bytes()).unwrap();
+                        if index == 0 {
+                            assert_eq!(value["id"], 0);
+                        } else {
+                            assert_eq!(value["params"]["index"], index - 1);
+                        }
+                    }
+                }
+            }
+            channel.tx.close_channel();
+            transport.await.unwrap();
+            assert!(channel.rx.next().await.is_none());
+        })
+        .await
+        .expect("burst replay or shutdown stalled");
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ready_sse_burst_still_fails_closed_for_stalled_consumer() {
+        let (url, server) = burst_fixture().await;
+        let (channel, transport) = HttpClient::with_endpoint(url)
+            .unwrap()
+            .with_limits(burst_limits())
+            .unwrap()
+            .into_bounded_channel_and_future();
+        channel.tx.try_send(initialize()).unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(5), transport)
+            .await
+            .expect("stalled consumer did not exhaust admission")
+            .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("bounded channel frame/byte admission exhausted"),
+            "{error:?}"
+        );
+        assert!(channel.tx.try_send(initialize()).is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ready_sse_burst_can_be_cancelled() {
+        let (url, server) = burst_fixture().await;
+        let (mut channel, mut transport) = HttpClient::with_endpoint(url)
+            .unwrap()
+            .with_limits(burst_limits())
+            .unwrap()
+            .into_bounded_channel_and_future();
+        channel.tx.try_send(initialize()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            for _ in 0..3 {
+                match futures::future::select(&mut transport, channel.rx.next()).await {
+                    futures::future::Either::Left((result, _)) => {
+                        panic!("burst driver exited: {result:?}")
+                    }
+                    futures::future::Either::Right((frame, _)) => {
+                        assert!(
+                            frame.is_some(),
+                            "burst channel closed: {:?}",
+                            (&mut transport).await
+                        );
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(transport);
+        assert!(channel.tx.try_send(initialize()).is_err());
+        server.abort();
+    }
 
     #[tokio::test]
     async fn graceful_eof_waits_for_delete_headers_not_body() {
@@ -1236,10 +1423,33 @@ impl Drop for ConnectionCleanup {
     }
 }
 
+// Keep no producer alive: ordinary EOF and explicit cooperative finish are
+// independent. A dropped finish hook does not request completion.
+fn finishable_bounded_outgoing(
+    mut outgoing: agent_client_protocol::BoundedReceiver,
+    finish: oneshot::Receiver<()>,
+) -> impl Stream<Item = ChargedFrame> + Unpin + Send {
+    let mut finish = Some(finish);
+    futures::stream::poll_fn(move |cx| {
+        if let Some(signal) = finish.as_mut() {
+            match std::future::Future::poll(std::pin::Pin::new(signal), cx) {
+                Poll::Ready(Ok(())) => {
+                    outgoing.close();
+                    finish = None;
+                }
+                Poll::Ready(Err(_)) => finish = None,
+                Poll::Pending => {}
+            }
+        }
+        std::pin::Pin::new(&mut outgoing).poll_next(cx)
+    })
+}
+
 async fn run_bounded(
     client: HttpClient,
     limits: HttpClientLimits,
     channel: BoundedChannel,
+    finish: oneshot::Receiver<()>,
 ) -> Result<(), AcpError> {
     struct Terminate {
         sender: agent_client_protocol::BoundedSender,
@@ -1261,7 +1471,7 @@ async fn run_bounded(
         connection: None,
     };
     let failed = terminal.sender.failure();
-    let running = run_bounded_inner(&mut cleanup, limits, channel).boxed();
+    let running = run_bounded_inner(&mut cleanup, limits, channel, finish).boxed();
     let result = match futures::future::select(failed, running).await {
         futures::future::Either::Left((error, running)) => {
             drop(running);
@@ -1286,6 +1496,7 @@ async fn run_bounded_inner(
     cleanup: &mut ConnectionCleanup,
     limits: HttpClientLimits,
     channel: BoundedChannel,
+    finish: oneshot::Receiver<()>,
 ) -> Result<(), AcpError> {
     enum Event {
         Outgoing(Option<ChargedFrame>),
@@ -1295,8 +1506,9 @@ async fn run_bounded_inner(
     let client = &cleanup.client;
     let BoundedChannel {
         tx: incoming,
-        rx: mut outgoing,
+        rx: outgoing,
     } = channel;
+    let mut outgoing = finishable_bounded_outgoing(outgoing, finish);
     let budget = Budget::new(&limits);
     let Some(first) = outgoing.next().await else {
         return Ok(());
@@ -1538,10 +1750,29 @@ async fn run_bounded_inner(
                     }
                     incoming.try_send(frame)?;
                     streams.futures.push(stream.next());
+                    // A ready SSE body can contain more frames than incoming
+                    // admission allows. Let the consumer drain between frames
+                    // even when the driver and consumer share one task. Real
+                    // overload still fails closed at the next admission.
+                    yield_once().await;
                 }
             },
         }
     }
+}
+
+async fn yield_once() {
+    let mut yielded = false;
+    futures::future::poll_fn(|cx| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
 }
 
 struct Sse {
@@ -1626,17 +1857,7 @@ impl Sse {
                     if work == 8192 {
                         // Cooperative yielding even for a continuously ready
                         // comment-only stream, without a spawned observer task.
-                        let mut yielded = false;
-                        futures::future::poll_fn(|cx| {
-                            if yielded {
-                                Poll::Ready(())
-                            } else {
-                                yielded = true;
-                                cx.waker().wake_by_ref();
-                                Poll::Pending
-                            }
-                        })
-                        .await;
+                        yield_once().await;
                         work = 0;
                     }
                 }

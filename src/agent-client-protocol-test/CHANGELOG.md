@@ -5,6 +5,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Keep the Tokio/futures compatibility adapter in dev dependencies for the
+  `arrow_proxy` example. Remove unused core JSON Schema and JSON log formatting
+  feature requests; retain native process/stdio support for test binaries.
+- Internal consumers disable this crate's unstable defaults and request their
+  own protocol features explicitly. The crate's `unstable` and
+  `unstable_protocol_v2` features remain available.
+- `testy` roots its scenario paths in the session `cwd` instead of `/tmp`: the
+  `fs/*` callback file, `terminal/create` working directories, tool-call
+  locations and diffs, and content `file:` URIs. Sessions in different
+  directories no longer share files; a session whose `cwd` is `/tmp` sees the
+  same paths as before.
+
 ### Added
 
 - Expand the `testy` binary into a deterministic ACP test agent that can exercise stable v1 agent methods, notifications, session updates, and client callbacks.

@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.6.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-cookbook-v3.5.0...agent-client-protocol-cookbook-v3.6.0) - 2026-10-28
+
+### Added
+
+- *(acp)* update agent-client-protocol-schema to 1.13.0 ([#443](https://github.com/agentclientprotocol/rust-sdk/pull/443))
+
+### Fixed
+
+- align examples, Testy and docs with ACP schema 1.13 ([#444](https://github.com/agentclientprotocol/rust-sdk/pull/444))
+
+## [3.5.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-cookbook-v3.4.0...agent-client-protocol-cookbook-v3.5.0) - 2026-10-22
+
+### Added
+
+- *(acp)* add ConnectionTo::terminated for every connection end ([#434](https://github.com/agentclientprotocol/rust-sdk/pull/434))
+
+## [3.4.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-cookbook-v3.3.0...agent-client-protocol-cookbook-v3.4.0) - 2026-10-16
+
+### Added
+
+- *(acp)* update schema to 1.12.0 and align v2 lifecycle ([#423](https://github.com/agentclientprotocol/rust-sdk/pull/423))
+
+## [3.1.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-cookbook-v3.0.0...agent-client-protocol-cookbook-v3.1.0) - 2026-10-07
+
+### Added
+
+- *(acp)* add prepared requests with preselected response handling ([#407](https://github.com/agentclientprotocol/rust-sdk/pull/407))
+
+## [3.0.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-cookbook-v2.2.0...agent-client-protocol-cookbook-v3.0.0) - 2026-10-06
+
+### Added
+
+- *(acp)* [**breaking**] make native transports and schema support opt-in ([#397](https://github.com/agentclientprotocol/rust-sdk/pull/397))
+- *(acp)* [**breaking**] adopt request-scoped MCP binding ([#388](https://github.com/agentclientprotocol/rust-sdk/pull/388))
+- *(rmcp)* [**breaking**] upgrade integration to rmcp 3.4
+
+### Other
+
+- prepare v3 package metadata and release guidance ([#404](https://github.com/agentclientprotocol/rust-sdk/pull/404))
+- slim dependency features and CI validation ([#399](https://github.com/agentclientprotocol/rust-sdk/pull/399))
+
+### Changed
+
+- Request rmcp's native MCP-over-ACP attachment feature explicitly for the
+  compiled recipes. Keep subprocess support for the `AcpAgent` recipe, but
+  remove unused core stdio and futures executor features from dev dependencies.
+
 ## [2.2.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-cookbook-v2.1.0...agent-client-protocol-cookbook-v2.2.0) - 2026-09-18
 
 ### Other

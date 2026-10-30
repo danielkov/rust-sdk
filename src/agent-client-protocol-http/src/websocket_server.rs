@@ -1,17 +1,17 @@
 use std::sync::Arc;
 
-use agent_client_protocol::{RawJsonRpcMessage, TransportFrame};
+use agent_client_protocol::TransportFrame;
 use axum::{
     extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     http::HeaderValue,
     response::Response,
 };
 use futures::{SinkExt, StreamExt};
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     connection::{ConnectionRegistry, OutboundLease},
-    protocol::{HEADER_CONNECTION_ID, session_id_from_message},
+    protocol::HEADER_CONNECTION_ID,
 };
 
 pub(crate) fn handle_ws_upgrade(
@@ -124,16 +124,16 @@ async fn run_ws_message_loop(
                             break;
                         }
                     }
-                    Some(Ok(WsMessage::Close(frame))) => {
-                        debug!(connection_id = %connection_id, "Client closed connection: {:?}", frame);
+                    Some(Ok(WsMessage::Close(_))) => {
+                        debug!(connection_id = %connection_id, "Client closed connection");
                         break;
                     }
                     Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => {}
                     Some(Ok(WsMessage::Binary(_))) => {
                         warn!(connection_id = %connection_id, "Ignoring binary message (ACP uses text)");
                     }
-                    Some(Err(e)) => {
-                        error!(connection_id = %connection_id, "WebSocket error: {e}");
+                    Some(Err(_)) => {
+                        error!(connection_id = %connection_id, "WebSocket receive failed");
                         break;
                     }
                     None => break,
@@ -154,14 +154,8 @@ async fn forward_client_text<S>(
 where
     S: futures::Sink<WsMessage> + Unpin,
 {
-    trace!(connection_id = %connection_id, payload = %text, "Client → Agent: {} bytes", text.len());
     let frame = TransportFrame::parse_json(&text);
-    if let TransportFrame::Single(parsed) = &frame
-        && let Some(sid) = session_id_from_message(parsed)
-        && let RawJsonRpcMessage::Request(req) = parsed
-    {
-        trace!(connection_id = %connection_id, session_id = %sid, request_id = ?req.id, "Client → Agent (session)");
-    }
+    crate::diagnostics::inbound(&frame, text.len(), "WebSocket");
     if connection.send_frame_to_agent(frame).is_err() {
         error!(connection_id = %connection_id, "Agent channel closed");
         drain_outbound_until_closed(ws_tx, outbound_rx, closed, connection_id).await;
@@ -223,7 +217,7 @@ async fn send_outbound_text<S>(ws_tx: &mut S, text: String, connection_id: &str)
 where
     S: futures::Sink<WsMessage> + Unpin,
 {
-    trace!(connection_id = %connection_id, payload = %text, "Agent → Client: {} bytes", text.len());
+    crate::diagnostics::outbound(text.len(), "WebSocket");
     if ws_tx.send(WsMessage::Text(text.into())).await.is_err() {
         error!(connection_id = %connection_id, "WebSocket send failed");
         false
@@ -235,12 +229,11 @@ where
 #[cfg(test)]
 mod tests {
     use agent_client_protocol::{
-        Channel, TransportBatch, TransportBatchEntry, TransportFrame,
-        schema::v1::{RequestId, Response as RpcResponse},
+        Channel, ConnectionDriver, RawJsonRpcMessage, RawJsonRpcResponse as RpcResponse,
+        TransportBatch, TransportBatchEntry, TransportFrame, schema::v1::RequestId,
     };
     use async_tungstenite::{tokio::connect_async, tungstenite::Message as ClientWsMessage};
     use axum::{Router, extract::WebSocketUpgrade, routing::get};
-    use futures::future::BoxFuture;
     use serde_json::json;
     use tokio::{
         net::TcpListener,
@@ -259,15 +252,10 @@ mod tests {
     }
 
     impl AgentFactory for CapturingAgentFactory {
-        fn spawn_agent(
-            &self,
-        ) -> (
-            Channel,
-            BoxFuture<'static, agent_client_protocol::Result<()>>,
-        ) {
+        fn spawn_agent(&self) -> (Channel, Option<ConnectionDriver>) {
             let (agent, transport) = Channel::duplex();
             let forwarded = self.forwarded.clone();
-            let future = Box::pin(async move {
+            let future = ConnectionDriver::new(async move {
                 let Channel {
                     rx: mut incoming,
                     tx: outgoing,
@@ -292,7 +280,7 @@ mod tests {
                 Ok(())
             });
 
-            (transport, future)
+            (transport, Some(future))
         }
     }
 
@@ -301,15 +289,10 @@ mod tests {
     }
 
     impl AgentFactory for BatchAgentFactory {
-        fn spawn_agent(
-            &self,
-        ) -> (
-            Channel,
-            BoxFuture<'static, agent_client_protocol::Result<()>>,
-        ) {
+        fn spawn_agent(&self) -> (Channel, Option<ConnectionDriver>) {
             let (mut agent, transport) = Channel::duplex();
             let forwarded = self.forwarded.clone();
-            let future = Box::pin(async move {
+            let future = ConnectionDriver::new(async move {
                 let Some(TransportFrame::Batch(batch)) = agent.rx.next().await else {
                     panic!("expected one batch frame");
                 };
@@ -336,7 +319,7 @@ mod tests {
                 std::future::pending::<agent_client_protocol::Result<()>>().await
             });
 
-            (transport, future)
+            (transport, Some(future))
         }
     }
 
@@ -345,15 +328,10 @@ mod tests {
     }
 
     impl AgentFactory for FinalFrameThenExitAgentFactory {
-        fn spawn_agent(
-            &self,
-        ) -> (
-            Channel,
-            BoxFuture<'static, agent_client_protocol::Result<()>>,
-        ) {
+        fn spawn_agent(&self) -> (Channel, Option<ConnectionDriver>) {
             let (agent, transport) = Channel::duplex();
             let emit = self.emit.clone();
-            let future = Box::pin(async move {
+            let future = ConnectionDriver::new(async move {
                 emit.notified().await;
                 agent
                     .tx
@@ -368,7 +346,7 @@ mod tests {
                 Ok(())
             });
 
-            (transport, future)
+            (transport, Some(future))
         }
     }
 
@@ -377,15 +355,10 @@ mod tests {
     }
 
     impl AgentFactory for FinalFrameAfterInputCloseAgentFactory {
-        fn spawn_agent(
-            &self,
-        ) -> (
-            Channel,
-            BoxFuture<'static, agent_client_protocol::Result<()>>,
-        ) {
+        fn spawn_agent(&self) -> (Channel, Option<ConnectionDriver>) {
             let (agent, transport) = Channel::duplex();
             let emit = self.emit.clone();
-            let future = Box::pin(async move {
+            let future = ConnectionDriver::new(async move {
                 drop(agent.rx);
                 emit.notified().await;
                 agent
@@ -401,7 +374,7 @@ mod tests {
                 Ok(())
             });
 
-            (transport, future)
+            (transport, Some(future))
         }
     }
 

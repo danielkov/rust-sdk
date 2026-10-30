@@ -11,6 +11,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
+const SESSION_TITLE: &str = "Testy v2 session";
+const SESSION_UPDATED_AT: &str = "2026-01-01T00:00:00Z";
+
 /// The native draft protocol v2 Testy agent.
 ///
 /// Construct this with [`super::Testy::v2`]. Unlike the v1 fixture, prompt
@@ -54,7 +57,11 @@ impl V2Testy {
         self.state.lock().expect("v2 Testy state lock poisoned")
     }
 
-    fn create_session(&self, request: acp::NewSessionRequest) -> acp::SessionId {
+    fn create_session(
+        &self,
+        request: acp::NewSessionRequest,
+    ) -> Result<acp::SessionId, agent_client_protocol::Error> {
+        reject_mcp_servers(&request.mcp_servers)?;
         let mut state = self.lock_state();
         loop {
             let session_id =
@@ -72,7 +79,7 @@ impl V2Testy {
                         history: Vec::new(),
                     },
                 );
-                return session_id;
+                return Ok(session_id);
             }
         }
     }
@@ -93,8 +100,8 @@ impl V2Testy {
             .map(|(session_id, session)| {
                 acp::SessionInfo::new(session_id.clone(), session.cwd.clone())
                     .additional_directories(session.additional_directories.clone())
-                    .title("Testy v2 session")
-                    .updated_at("2026-01-01T00:00:00Z")
+                    .title(SESSION_TITLE)
+                    .updated_at(SESSION_UPDATED_AT)
             })
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| {
@@ -109,11 +116,12 @@ impl V2Testy {
         &self,
         request: &acp::ResumeSessionRequest,
     ) -> Result<Vec<acp::SessionUpdate>, agent_client_protocol::Error> {
+        reject_mcp_servers(&request.mcp_servers)?;
         let mut state = self.lock_state();
         let session = state
             .sessions
             .get_mut(&request.session_id)
-            .ok_or_else(|| invalid_params(format!("unknown session `{}`", request.session_id)))?;
+            .ok_or_else(|| session_not_found(&request.session_id))?;
         if session.foreground_work {
             return Err(invalid_params(format!(
                 "session `{}` still has foreground work",
@@ -145,20 +153,20 @@ impl V2Testy {
     fn begin_prompt(
         &self,
         session_id: &acp::SessionId,
+        prompt: &[acp::ContentBlock],
     ) -> Result<(), agent_client_protocol::Error> {
         let mut state = self.lock_state();
         let session = state
             .sessions
             .get_mut(session_id)
-            .ok_or_else(|| invalid_params(format!("unknown session `{session_id}`")))?;
-        if !session.active {
-            return Err(invalid_params(format!("closed session `{session_id}`")));
-        }
+            .filter(|session| session.active)
+            .ok_or_else(|| session_not_found(session_id))?;
         if session.foreground_work {
             return Err(invalid_params(format!(
                 "session `{session_id}` already has foreground work"
             )));
         }
+        validate_prompt_content(prompt)?;
         session.foreground_work = true;
         session.cancelled = false;
         Ok(())
@@ -182,7 +190,7 @@ impl V2Testy {
         let session = state
             .sessions
             .get_mut(session_id)
-            .ok_or_else(|| invalid_params(format!("unknown session `{session_id}`")))?;
+            .ok_or_else(|| session_not_found(session_id))?;
         let stop_reason = if session.cancelled || !session.active {
             acp::StopReason::Cancelled
         } else {
@@ -228,7 +236,8 @@ impl V2Testy {
         let session = state
             .sessions
             .get_mut(session_id)
-            .ok_or_else(|| invalid_params(format!("unknown session `{session_id}`")))?;
+            .filter(|session| session.active)
+            .ok_or_else(|| session_not_found(session_id))?;
         session.active = false;
         if session.foreground_work {
             session.cancelled = true;
@@ -352,17 +361,13 @@ impl V2Testy {
                     },
                 )
             }
-            TestyCommand::RunScenario { scenario } => (
-                format!(
-                    "Testy v2 scenario `{}` is not implemented yet",
-                    scenario.name()
-                ),
-                acp::StopReason::Refusal,
-            ),
-            TestyCommand::CallTool { .. } | TestyCommand::ListTools { .. } => (
-                "Testy v2 does not advertise MCP support yet".to_string(),
-                acp::StopReason::Refusal,
-            ),
+            TestyCommand::RunScenario { scenario } => unsupported_command(format!(
+                "Testy v2 scenario `{}` is not implemented yet",
+                scenario.name()
+            )),
+            TestyCommand::CallTool { .. } | TestyCommand::ListTools { .. } => {
+                unsupported_command("Testy v2 does not advertise MCP support yet".to_string())
+            }
         };
 
         if requested_stop_reason != acp::StopReason::Cancelled && !self.is_cancelled(&session_id) {
@@ -417,8 +422,12 @@ impl ConnectTo<Client> for V2Testy {
                     async move |request: acp::NewSessionRequest,
                                 responder: Responder<acp::NewSessionResponse>,
                                 _connection: V2ConnectionTo<Client>| {
-                        let session_id = agent.create_session(request);
-                        responder.respond(acp::NewSessionResponse::new(session_id))
+                        match agent.create_session(request) {
+                            Ok(session_id) => {
+                                responder.respond(acp::NewSessionResponse::new(session_id))
+                            }
+                            Err(error) => responder.respond_with_error(error),
+                        }
                     }
                 },
                 agent_client_protocol::on_receive_request!(),
@@ -429,6 +438,13 @@ impl ConnectTo<Client> for V2Testy {
                     async move |request: acp::ListSessionsRequest,
                                 responder: Responder<acp::ListSessionsResponse>,
                                 _connection: V2ConnectionTo<Client>| {
+                        // Testy returns every session in one page and never issues a
+                        // `nextCursor`, so any cursor a client sends is invalid.
+                        if let Some(cursor) = &request.cursor {
+                            return responder.respond_with_error(invalid_params(format!(
+                                "invalid session/list cursor `{cursor}`"
+                            )));
+                        }
                         responder.respond(acp::ListSessionsResponse::new(
                             agent.list_sessions(&request),
                         ))
@@ -449,6 +465,26 @@ impl ConnectTo<Client> for V2Testy {
                         for update in replay {
                             send_update(&connection, &request.session_id, update)?;
                         }
+                        // Synchronize current metadata rather than replaying
+                        // historical changes.
+                        send_update(
+                            &connection,
+                            &request.session_id,
+                            acp::SessionUpdate::SessionInfoUpdate(
+                                acp::SessionInfoUpdate::new()
+                                    .title(SESSION_TITLE)
+                                    .updated_at(SESSION_UPDATED_AT),
+                            ),
+                        )?;
+                        // Testy only resumes sessions without foreground work.
+                        // This is a live snapshot, not replayed turn completion.
+                        send_update(
+                            &connection,
+                            &request.session_id,
+                            acp::SessionUpdate::StateUpdate(acp::StateUpdate::Idle(
+                                acp::IdleStateUpdate::new(),
+                            )),
+                        )?;
                         responder.respond(acp::ResumeSessionResponse::new())
                     }
                 },
@@ -485,7 +521,7 @@ impl ConnectTo<Client> for V2Testy {
                                 responder: Responder<acp::PromptResponse>,
                                 connection: V2ConnectionTo<Client>| {
                         let session_id = request.session_id.clone();
-                        if let Err(error) = agent.begin_prompt(&session_id) {
+                        if let Err(error) = agent.begin_prompt(&session_id, &request.prompt) {
                             return responder.respond_with_error(error);
                         }
 
@@ -529,6 +565,20 @@ impl ConnectTo<Client> for V2Testy {
     }
 }
 
+/// Testy advertises no prompt capabilities, so only the baseline `text` and `resource_link`
+/// blocks are supported. v2 Agents must reject any other block with `-32602`.
+fn validate_prompt_content(
+    blocks: &[acp::ContentBlock],
+) -> Result<(), agent_client_protocol::Error> {
+    for block in blocks {
+        match block {
+            acp::ContentBlock::Text(_) | acp::ContentBlock::ResourceLink(_) => {}
+            _ => return Err(invalid_params("unsupported prompt content block")),
+        }
+    }
+    Ok(())
+}
+
 fn extract_text_from_prompt(blocks: &[acp::ContentBlock]) -> String {
     blocks
         .iter()
@@ -563,4 +613,31 @@ fn send_update(
 
 fn invalid_params(message: impl ToString) -> agent_client_protocol::Error {
     agent_client_protocol::Error::invalid_params().data(message.to_string())
+}
+
+/// `-32002` for a session that does not exist or is not active on this connection.
+fn session_not_found(session_id: &acp::SessionId) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::session_not_found(session_id.0.clone())
+}
+
+/// Testy v2 advertises no `session.mcp` transports, so every MCP server is
+/// unsupported and the request must fail with `-32602`.
+fn reject_mcp_servers(mcp_servers: &[acp::McpServer]) -> Result<(), agent_client_protocol::Error> {
+    if mcp_servers.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid_params(
+            "Testy v2 does not advertise any MCP server transports",
+        ))
+    }
+}
+
+/// Ends a command Testy v2 cannot run with an `error` stop reason; `refusal`
+/// is reserved for the agent refusing to continue.
+fn unsupported_command(message: String) -> (String, acp::StopReason) {
+    let error = acp::Error::invalid_params().data(message.clone());
+    (
+        message,
+        acp::StopReason::Error(acp::ErrorStopReason::new().error(error)),
+    )
 }

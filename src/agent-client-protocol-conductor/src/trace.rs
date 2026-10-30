@@ -11,11 +11,12 @@ use std::time::Instant;
 
 use agent_client_protocol::schema::SuccessorMessage;
 use agent_client_protocol::schema::v1::{
-    MessageMcpNotification, MessageMcpRequest, Notification as RpcNotification,
-    Request as RpcRequest, RequestId, Response as RpcResponse,
+    MessageMcpNotification, MessageMcpRequest, MessageMcpResponse, Notification as RpcNotification,
+    Request as RpcRequest, RequestId,
 };
 use agent_client_protocol::{
-    DynConnectTo, JsonRpcMessage, RawJsonRpcMessage, RawJsonRpcParams, Role, UntypedMessage,
+    DynConnectTo, JsonRpcMessage, RawJsonRpcMessage, RawJsonRpcParams,
+    RawJsonRpcResponse as RpcResponse, Role, UntypedMessage,
 };
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
@@ -97,6 +98,11 @@ pub struct ResponseEvent {
 
     /// True if this is an error response.
     pub is_error: bool,
+
+    /// Whether an error belongs to the ACP binding or the inner MCP peer.
+    /// Older trace files omit this provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_domain: Option<Protocol>,
 
     /// Response result or error object.
     pub payload: serde_json::Value,
@@ -181,12 +187,7 @@ impl std::fmt::Debug for TraceWriter {
 }
 
 struct RequestDetails {
-    #[expect(dead_code)]
     protocol: Protocol,
-
-    #[expect(dead_code)]
-    method: String,
-
     request_from: ComponentIndex,
     request_to: ComponentIndex,
 }
@@ -232,13 +233,13 @@ impl TraceWriter {
         id: serde_json::Value,
         method: String,
         session: Option<String>,
-        params: serde_json::Value,
+        mut params: serde_json::Value,
     ) {
+        redact_credentials(&mut params);
         self.request_details.insert(
             id.clone(),
             RequestDetails {
                 protocol,
-                method: method.clone(),
                 request_from: from,
                 request_to: to,
             },
@@ -261,15 +262,17 @@ impl TraceWriter {
         from: ComponentIndex,
         to: ComponentIndex,
         id: serde_json::Value,
-        is_error: bool,
-        payload: serde_json::Value,
+        error_domain: Option<Protocol>,
+        mut payload: serde_json::Value,
     ) {
+        redact_credentials(&mut payload);
         self.write_event(&TraceEvent::Response(ResponseEvent {
             ts: self.elapsed(),
             from: format!("{from:?}"),
             to: format!("{to:?}"),
             id,
-            is_error,
+            is_error: error_domain.is_some(),
+            error_domain,
             payload,
         }));
     }
@@ -282,8 +285,9 @@ impl TraceWriter {
         to: ComponentIndex,
         method: impl Into<String>,
         session: Option<String>,
-        params: serde_json::Value,
+        mut params: serde_json::Value,
     ) {
+        redact_credentials(&mut params);
         self.write_event(&TraceEvent::Notification(NotificationEvent {
             ts: self.elapsed(),
             protocol,
@@ -367,13 +371,13 @@ impl TraceWriter {
                 };
                 let id = id_to_json(&id);
                 if let Some(RequestDetails {
-                    protocol: _,
-                    method: _,
+                    protocol,
                     request_from,
                     request_to,
                 }) = self.request_details.remove(&id)
                 {
-                    self.response(request_to, request_from, id, is_error, payload);
+                    let (error_domain, payload) = response_outcome(protocol, is_error, payload);
+                    self.response(request_to, request_from, id, error_domain, payload);
                 }
             }
         }
@@ -526,6 +530,168 @@ fn params_from_transport(params: Option<RawJsonRpcParams>) -> serde_json::Value 
     params.map_or(serde_json::Value::Null, RawJsonRpcParams::into_value)
 }
 
+/// Keep an MCP outcome separate from a failure of its ACP binding.
+fn response_outcome(
+    protocol: Protocol,
+    outer_error: bool,
+    payload: serde_json::Value,
+) -> (Option<Protocol>, serde_json::Value) {
+    if outer_error {
+        return (Some(Protocol::Acp), payload);
+    }
+    if protocol == Protocol::Mcp {
+        match serde_json::from_value::<MessageMcpResponse>(payload.clone()) {
+            Ok(MessageMcpResponse::Result { result, .. }) => return (None, result),
+            Ok(MessageMcpResponse::Error { error, .. }) => {
+                return (
+                    Some(Protocol::Mcp),
+                    serde_json::to_value(error).expect("MCP errors contain only JSON values"),
+                );
+            }
+            // Preserve a malformed carrier as observed, not as an invented error.
+            _ => {}
+        }
+    }
+    (None, payload)
+}
+
+/// Replacement for credential values in trace copies.
+const REDACTED: &str = "[REDACTED]";
+
+/// Redact only the trace copy; transport declarations keep their credentials.
+///
+/// Every `env` and `headers` value is replaced, keeping only the names: ACP
+/// uses these fields for MCP server declarations (`session/new`, `session/load`,
+/// `session/resume`, `session/fork`, and their v2 equivalents), terminal auth
+/// methods, terminal creation, and provider configuration, and any of their
+/// values may be a credential. HTTP URLs lose userinfo and credential-like
+/// query values. Other payload fields, such as prompts and file contents, are
+/// recorded as-is: this is not a general-purpose sanitizer.
+pub(crate) fn redact_credentials(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(url)) = object.get_mut("url")
+                && let Some(redacted) = redact_http_url(url)
+            {
+                *url = redacted;
+            }
+            for (key, field) in object.iter_mut() {
+                if key == "env" || key == "headers" {
+                    redact_name_value_pairs(field);
+                }
+                redact_credentials(field);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            values.iter_mut().for_each(redact_credentials);
+        }
+        _ => {}
+    }
+}
+
+/// Redact the values of `[{ "name", "value" }]` lists and `{ name: value }` maps.
+fn redact_name_value_pairs(field: &mut serde_json::Value) {
+    let redacted = || serde_json::Value::String(REDACTED.to_owned());
+    match field {
+        serde_json::Value::Array(entries) => {
+            for entry in entries {
+                if let Some(value) = entry.get_mut("value") {
+                    *value = redacted();
+                }
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for value in entries.values_mut() {
+                *value = redacted();
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Recognize common credential keys, case-insensitively and after URL decoding.
+/// Hyphenated, underscored, and compact spellings share the same rule.
+fn is_secret_query_key(name: &str) -> bool {
+    let normalized: String = name
+        .chars()
+        .filter(|c| !matches!(c, '-' | '_'))
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    matches!(
+        normalized.as_str(),
+        "token"
+            | "accesstoken"
+            | "refreshtoken"
+            | "idtoken"
+            | "apikey"
+            | "key"
+            | "secret"
+            | "clientsecret"
+            | "password"
+            | "passwd"
+            | "pwd"
+            | "auth"
+            | "authorization"
+            | "bearer"
+            | "signature"
+            | "sig"
+            | "credential"
+            | "credentials"
+    )
+}
+
+fn redact_http_url(value: &str) -> Option<String> {
+    let mut url = match url::Url::parse(value) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => url,
+        Ok(_) => return None,
+        Err(_) => {
+            // Do not retain credentials in an HTTP URL we cannot safely inspect.
+            // Match WHATWG preprocessing: trim leading C0/space and ignore
+            // ASCII tabs/newlines within the scheme, just as the URL parser does.
+            let scheme: String = value
+                .trim_start_matches(|c: char| c <= '\u{20}')
+                .split(':')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| !matches!(c, '\t' | '\n' | '\r'))
+                .collect();
+            return (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
+                .then(|| REDACTED.to_owned());
+        }
+    };
+    let mut changed = false;
+    if !url.username().is_empty() || url.password().is_some() {
+        // HTTP URLs have an authority, so clearing userinfo cannot fail.
+        url.set_password(None).expect("HTTP URL has an authority");
+        url.set_username("").expect("HTTP URL has an authority");
+        changed = true;
+    }
+    if let Some(query) = url.query() {
+        // Preserve spelling, order, duplicates, and encoding of non-secret pairs.
+        let redacted = query
+            .split('&')
+            .map(|pair| {
+                let is_secret = url::form_urlencoded::parse(pair.as_bytes())
+                    .next()
+                    .is_some_and(|(key, _)| is_secret_query_key(&key));
+                if is_secret {
+                    changed = true;
+                    let key = pair.split('=').next().unwrap_or_default();
+                    format!("{key}=[REDACTED]")
+                } else {
+                    pair.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("&");
+        url.set_query(Some(&redacted));
+    }
+    // Leave credential-free URLs byte-for-byte unchanged. Credential-bearing
+    // URLs may be canonicalized by the URL parser when stripping userinfo.
+    changed.then(|| url.into())
+}
+
 /// A message observed going over a channel connected to `left` and `right`.
 /// This could be a successor message, a mcp-over-acp message, etc.
 #[derive(Debug)]
@@ -651,26 +817,288 @@ mod tests {
     use agent_client_protocol::RawJsonRpcMessage;
     use serde_json::json;
 
-    use super::{MessageInfo, Protocol};
+    use super::{MessageInfo, Protocol, ResponseEvent, redact_credentials, response_outcome};
 
     #[test]
-    fn tolerant_mcp_notification_params_are_traced_as_mcp() {
-        let RawJsonRpcMessage::Notification(notification) = RawJsonRpcMessage::notification(
-            "mcp/message".into(),
-            json!({
-                "connectionId": "connection-1",
-                "method": "notifications/progress",
-                "params": ["invalid named params"]
-            }),
-        )
-        .expect("notification is valid JSON-RPC") else {
+    fn http_url_redaction_handles_encoded_keys_duplicates_and_userinfo() {
+        let mut value = json!({
+            "url":"HTTPS://user:p%40ss@example.test:8443/mcp?mode=a%20b&%61ccess_TOKEN=one&api-key=two&token&token=three&&count=2#section"
+        });
+        redact_credentials(&mut value);
+        assert_eq!(
+            value["url"],
+            "https://example.test:8443/mcp?mode=a%20b&%61ccess_TOKEN=[REDACTED]&api-key=[REDACTED]&token=[REDACTED]&token=[REDACTED]&&count=2#section"
+        );
+        let once = value.clone();
+        redact_credentials(&mut value);
+        assert_eq!(value, once, "redaction must be idempotent");
+
+        for key in [
+            "TOKEN",
+            "access_token",
+            "refresh-token",
+            "idToken",
+            "api_key",
+            "key",
+            "secret",
+            "client_secret",
+            "password",
+            "passwd",
+            "pwd",
+            "auth",
+            "authorization",
+            "bearer",
+            "signature",
+            "sig",
+            "credential",
+            "credentials",
+        ] {
+            let mut value = json!({"url":format!("http://example.test/mcp?{key}=private&mode=ok")});
+            redact_credentials(&mut value);
+            assert_eq!(
+                value["url"],
+                format!("http://example.test/mcp?{key}=[REDACTED]&mode=ok")
+            );
+        }
+        for url in [
+            "https://user@example.test/mcp",
+            "https://:private@example.test/mcp",
+            "https://u%40ser:p%40ss@example.test/mcp",
+        ] {
+            let mut value = json!({"url":url});
+            redact_credentials(&mut value);
+            assert_eq!(value["url"], "https://example.test/mcp");
+        }
+        for scheme in [
+            "https",
+            "http\t",
+            "ht\ntps",
+            "h\rttp",
+            "\u{0}https",
+            "\u{1f}http",
+        ] {
+            let mut invalid = json!({
+                "url":format!("{scheme}://user:private@[bad-host]/?token=private")
+            });
+            redact_credentials(&mut invalid);
+            assert_eq!(invalid["url"], "[REDACTED]");
+        }
+    }
+
+    #[test]
+    fn credential_free_urls_and_explicit_payloads_are_preserved() {
+        let original = json!({
+            "url":"HTTPS://EXAMPLE.test:443/mcp?mode=a+b&mode=a%20b&&count=2#section",
+            "nonHttp":{"url":"file:///tmp/data?token=visible"},
+            "prompt":"an intentionally recorded prompt",
+            "image":{"data":"intentionally recorded image"},
+            "file":{"content":"intentionally recorded file"},
+            "customSecret":"not a recognized credential field"
+        });
+        let mut trace_copy = original.clone();
+        redact_credentials(&mut trace_copy);
+        assert_eq!(trace_copy, original);
+    }
+
+    #[tokio::test]
+    async fn recording_redacts_all_event_kinds_without_changing_wire_messages() {
+        use super::{ComponentIndex, TraceEvent, TraceWriter};
+        use agent_client_protocol::{Channel, ConnectTo, TransportFrame, UntypedRole};
+        use futures::StreamExt as _;
+
+        tokio::task::LocalSet::new().run_until(async {
+            let payload = json!({
+                "mcpServers":[{
+                    "type":"http", "url":"https://user:private@example.test/mcp?token=private&mode=ok",
+                    "headers":[{"name":"Authorization","value":"Bearer private"},
+                        {"name":"visible","value":"ok"}]
+                }],
+                "prompt":"recorded prompt", "image":{"data":"recorded image"},
+                "file":{"content":"recorded file"}
+            });
+            let (events_tx, mut events_rx) = futures::channel::mpsc::unbounded();
+            let (handle, recording) = TraceWriter::new(events_tx).spawn();
+            let recording = tokio::task::spawn_local(recording);
+            let (client, mut client_peer) = Channel::duplex();
+            let (base, mut base_peer) = Channel::duplex();
+            let bridge = handle.bridge_component::<UntypedRole>(
+                ComponentIndex::Proxy(0), ComponentIndex::Agent, base);
+            let bridge = tokio::task::spawn_local(bridge.connect_to(client));
+            drop(handle);
+
+            let request = RawJsonRpcMessage::request("test/request".into(), payload.clone(), 1.into()).unwrap();
+            let notification = RawJsonRpcMessage::notification("test/notification".into(), payload.clone()).unwrap();
+            for message in [request, notification] {
+                let frame = TransportFrame::Single(message);
+                let original_wire = frame.to_json().unwrap();
+                client_peer.tx.unbounded_send(frame).unwrap();
+                let forwarded = base_peer.rx.next().await.unwrap();
+                assert_eq!(forwarded.to_json().unwrap(), original_wire);
+            }
+            let response = TransportFrame::Single(RawJsonRpcMessage::response(1.into(), Ok(payload.clone())));
+            let original_wire = response.to_json().unwrap();
+            base_peer.tx.unbounded_send(response).unwrap();
+            assert_eq!(client_peer.rx.next().await.unwrap().to_json().unwrap(), original_wire);
+            drop(client_peer.tx);
+            drop(base_peer.tx);
+            bridge.await.unwrap().unwrap();
+            recording.await.unwrap().unwrap();
+
+            let mut expected = payload.clone();
+            expected["mcpServers"][0]["url"] =
+                json!("https://example.test/mcp?token=[REDACTED]&mode=ok");
+            expected["mcpServers"][0]["headers"][0]["value"] = json!("[REDACTED]");
+            expected["mcpServers"][0]["headers"][1]["value"] = json!("[REDACTED]");
+            let mut count = 0;
+            while let Some(event) = events_rx.next().await {
+                let recorded = match event {
+                    TraceEvent::Request(event) => event.params,
+                    TraceEvent::Notification(event) => event.params,
+                    TraceEvent::Response(event) => event.payload,
+                };
+                assert_eq!(recorded, expected);
+                count += 1;
+            }
+            assert_eq!(count, 3);
+            assert_eq!(payload["mcpServers"][0]["headers"][0]["value"], "Bearer private");
+        }).await;
+    }
+
+    #[test]
+    fn mcp_and_binding_errors_keep_their_domains() {
+        let inner = json!({"code":-32000,"message":"peer","data":null,"extension":true});
+        assert_eq!(
+            response_outcome(Protocol::Mcp, false, json!({"error":inner})),
+            (Some(Protocol::Mcp), inner)
+        );
+        let outer = json!({"code":-33002,"message":"binding failure"});
+        assert_eq!(
+            response_outcome(Protocol::Mcp, true, outer.clone()),
+            (Some(Protocol::Acp), outer)
+        );
+        for result in [
+            json!(null),
+            json!({"resultType":"input_required","requestState":"opaque"}),
+        ] {
+            assert_eq!(
+                response_outcome(Protocol::Mcp, false, json!({"result":result})),
+                (None, result)
+            );
+        }
+    }
+
+    #[test]
+    fn old_trace_response_without_domain_remains_readable() {
+        let event: ResponseEvent = serde_json::from_value(json!({
+            "ts":0,"from":"client","to":"agent","id":1,"is_error":true,
+            "payload":{"code":-32602,"message":"old trace"}
+        }))
+        .unwrap();
+        assert!(event.is_error);
+        assert_eq!(event.error_domain, None);
+    }
+
+    #[test]
+    fn declaration_credentials_are_redacted_without_changing_transport_payload() {
+        let original = json!({"mcpServers":[
+            {"headers":[{"name":"Authorization","value":"Bearer private"},{"name":"X-Custom","value":"private"}]},
+            {"headers":{"COOKIE":"private","X-Custom":"private"}}
+        ]});
+        let mut trace_copy = original.clone();
+        redact_credentials(&mut trace_copy);
+        assert_eq!(
+            trace_copy,
+            json!({"mcpServers":[
+                {"headers":[{"name":"Authorization","value":"[REDACTED]"},{"name":"X-Custom","value":"[REDACTED]"}]},
+                {"headers":{"COOKIE":"[REDACTED]","X-Custom":"[REDACTED]"}}
+            ]})
+        );
+        assert_eq!(
+            original["mcpServers"][0]["headers"][0]["value"],
+            "Bearer private"
+        );
+    }
+
+    #[test]
+    fn session_setup_env_and_header_values_are_redacted() {
+        const SECRET: &str = "SYNTHETIC_PRIVATE_CREDENTIAL";
+        let mcp_servers = json!([
+            {"name":"stdio","command":"/bin/server","args":["--flag"],
+             "env":[{"name":"API_KEY","value":SECRET},{"name":"PLAIN","value":SECRET}]},
+            {"type":"http","name":"http","url":"https://example.test/mcp",
+             "headers":[{"name":"X-Api-Token","value":SECRET}]},
+            {"type":"sse","name":"sse","url":"https://example.test/sse",
+             "headers":[{"name":"Authorization","value":SECRET}]}
+        ]);
+        // session/new, session/load, session/resume, session/fork (v1 and v2)
+        // all declare MCP servers the same way.
+        for mut params in [
+            json!({"cwd":"/work","mcpServers":mcp_servers}),
+            json!({"sessionId":"s","cwd":"/work","mcpServers":mcp_servers}),
+            json!({"sessionId":"s","cwd":"/work","mcpServers":mcp_servers,"_meta":{"x":1}}),
+            // Terminal auth methods in an initialize response (v1 map, v2 list).
+            json!({"authMethods":[{"type":"terminal","id":"t","name":"T","env":{"TOKEN":SECRET}}]}),
+            json!({"authMethods":[{"type":"terminal","id":"t","name":"T","env":[{"name":"TOKEN","value":SECRET}]}]}),
+            // terminal/create.
+            json!({"sessionId":"s","command":"/bin/sh","env":[{"name":"TOKEN","value":SECRET}]}),
+        ] {
+            redact_credentials(&mut params);
+            let recorded = params.to_string();
+            assert!(!recorded.contains(SECRET), "{recorded}");
+            assert!(recorded.contains("[REDACTED]"), "{recorded}");
+        }
+
+        let mut params = json!({"cwd":"/work","mcpServers":mcp_servers});
+        redact_credentials(&mut params);
+        assert_eq!(
+            params["mcpServers"][0]["env"],
+            json!([{"name":"API_KEY","value":"[REDACTED]"},{"name":"PLAIN","value":"[REDACTED]"}])
+        );
+        assert_eq!(params["mcpServers"][0]["args"], json!(["--flag"]));
+        assert_eq!(params["mcpServers"][1]["headers"][0]["name"], "X-Api-Token");
+        assert_eq!(params["cwd"], "/work");
+    }
+
+    #[test]
+    fn malformed_mcp_notification_preserves_the_observed_envelope() {
+        let params = json!({
+            "serverId": "server-1",
+            "requestId": "request-1",
+            "method": "notifications/progress",
+            "params": ["invalid named params"]
+        });
+        let RawJsonRpcMessage::Notification(notification) =
+            RawJsonRpcMessage::notification("mcp/message".into(), params.clone())
+                .expect("notification is valid JSON-RPC")
+        else {
             unreachable!("notification constructor returned a different message kind")
         };
 
         let info = MessageInfo::from_notification(notification);
 
+        // Schema 1.10.1 requires named inner parameters. Do not pretend this
+        // malformed envelope was a successfully decoded MCP notification.
+        assert_eq!(info.protocol, Protocol::Acp);
+        assert_eq!(info.method, "mcp/message");
+        assert_eq!(info.params, params);
+    }
+
+    #[test]
+    fn valid_mcp_notification_is_traced_as_inner_mcp() {
+        let params = json!({"progressToken":"token", "progress":1});
+        let RawJsonRpcMessage::Notification(notification) = RawJsonRpcMessage::notification(
+            "mcp/message".into(),
+            json!({
+                "serverId":"server-1","requestId":"request-1",
+                "method":"notifications/progress","params":params
+            }),
+        )
+        .unwrap() else {
+            unreachable!("notification constructor")
+        };
+        let info = MessageInfo::from_notification(notification);
         assert_eq!(info.protocol, Protocol::Mcp);
         assert_eq!(info.method, "notifications/progress");
-        assert_eq!(info.params, serde_json::Value::Null);
+        assert_eq!(info.params, params);
     }
 }

@@ -1,8 +1,8 @@
 use std::pin::pin;
 
 // Types re-exported from crate root
+use crate::RawJsonRpcResponse as Response;
 use crate::jsonrpc::{RawJsonRpcMessage, TransportBatch, TransportBatchEntry, TransportFrame};
-use crate::schema::v1::Response;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use serde::Deserialize as _;
@@ -17,7 +17,13 @@ fn parse_incoming_line(line: &str) -> ParsedIncomingLine {
     let value = match serde_json::from_str::<serde_json::Value>(line) {
         Ok(value) => value,
         Err(error) => {
-            tracing::debug!(?error, "Failed to parse incoming JSON-RPC JSON");
+            // Serde reasons can quote input, so log only the category and position.
+            tracing::debug!(
+                category = ?error.classify(),
+                line = error.line(),
+                column = error.column(),
+                "Failed to parse incoming JSON-RPC JSON"
+            );
             return ParsedIncomingLine::Malformed {
                 raw: line.to_owned(),
                 error: crate::Error::parse_error().data(serde_json::json!({ "line": line })),
@@ -36,7 +42,10 @@ fn parse_incoming_line(line: &str) -> ParsedIncomingLine {
                 .map(|entry| match RawJsonRpcMessage::deserialize(&entry) {
                     Ok(message) => TransportBatchEntry::message(message),
                     Err(error) => {
-                        tracing::debug!(?error, "Invalid JSON-RPC batch entry");
+                        tracing::debug!(
+                            category = ?error.classify(),
+                            "Invalid JSON-RPC batch entry"
+                        );
                         TransportBatchEntry::malformed(entry, crate::Error::invalid_request())
                     }
                 })
@@ -50,7 +59,7 @@ fn parse_incoming_line(line: &str) -> ParsedIncomingLine {
         value => match serde_json::from_value(value) {
             Ok(message) => ParsedIncomingLine::Single(message),
             Err(error) => {
-                tracing::debug!(?error, "Invalid JSON-RPC message");
+                tracing::debug!(category = ?error.classify(), "Invalid JSON-RPC message");
                 ParsedIncomingLine::Malformed {
                     raw: line.to_owned(),
                     error: crate::Error::invalid_request(),
@@ -122,7 +131,10 @@ async fn transport_outgoing_frames_actor(
             TransportFrame::Single(message) => message,
             TransportFrame::Malformed { raw, .. } => {
                 let raw = malformed_line_value(raw)?;
-                tracing::trace!(message = ?raw, "Relaying invalid JSON-RPC value");
+                tracing::trace!(
+                    message = %crate::util::redacted_json_line(&raw),
+                    "Relaying invalid JSON-RPC value"
+                );
                 outgoing_lines
                     .send(raw)
                     .await
@@ -132,7 +144,7 @@ async fn transport_outgoing_frames_actor(
             TransportFrame::Batch(batch) => {
                 let line =
                     serde_json::to_string(&batch).map_err(crate::Error::into_internal_error)?;
-                tracing::trace!(message = %line, "Sending JSON-RPC batch");
+                tracing::trace!(message = %crate::util::redacted_json_line(&line), "Sending JSON-RPC batch");
                 outgoing_lines
                     .send(line)
                     .await
@@ -142,7 +154,7 @@ async fn transport_outgoing_frames_actor(
         };
         match serde_json::to_string(&json_rpc_message) {
             Ok(line) => {
-                tracing::trace!(message = %line, "Sending JSON-RPC message");
+                tracing::trace!(message = %crate::util::redacted_json_line(&line), "Sending JSON-RPC message");
                 outgoing_lines
                     .send(line)
                     .await
@@ -186,7 +198,81 @@ async fn transport_outgoing_frames_actor(
             }
         }
     }
-    Ok(())
+    outgoing_lines
+        .close()
+        .await
+        .map_err(crate::Error::into_internal_error)
+}
+
+/// A newline writer whose sink close reaches the actual write half. An unfold
+/// sink can flush each line, but has no way to forward `AsyncWrite::close`.
+pub(super) struct LineWriter<W> {
+    writer: std::pin::Pin<Box<W>>,
+    bytes: Vec<u8>,
+    written: usize,
+    closing: bool,
+}
+
+impl<W> LineWriter<W> {
+    pub(super) fn new(writer: W) -> Self {
+        Self {
+            writer: Box::pin(writer),
+            bytes: Vec::new(),
+            written: 0,
+            closing: false,
+        }
+    }
+}
+
+impl<W: futures::AsyncWrite> futures::Sink<String> for LineWriter<W> {
+    type Error = std::io::Error;
+
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.poll_flush(cx)
+    }
+
+    fn start_send(self: std::pin::Pin<&mut Self>, line: String) -> Result<(), Self::Error> {
+        let this = self.get_mut();
+        this.bytes = line.into_bytes();
+        this.bytes.push(b'\n');
+        this.written = 0;
+        Ok(())
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        while this.written < this.bytes.len() {
+            let count = futures::ready!(
+                this.writer
+                    .as_mut()
+                    .poll_write(cx, &this.bytes[this.written..])
+            )?;
+            if count == 0 {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::WriteZero.into()));
+            }
+            this.written += count;
+        }
+        this.bytes.clear();
+        this.written = 0;
+        this.writer.as_mut().poll_flush(cx)
+    }
+
+    fn poll_close(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        if !self.closing {
+            futures::ready!(self.as_mut().poll_flush(cx))?;
+            self.closing = true;
+        }
+        self.get_mut().writer.as_mut().poll_close(cx)
+    }
 }
 
 fn malformed_line_value(raw: String) -> Result<String, crate::Error> {
@@ -202,7 +288,7 @@ fn malformed_line_value(raw: String) -> Result<String, crate::Error> {
 }
 
 pub(super) async fn transport_outgoing_lines_actor(
-    transport_rx: mpsc::UnboundedReceiver<TransportFrame>,
+    transport_rx: impl futures::Stream<Item = TransportFrame>,
     outgoing_lines: impl futures::Sink<String, Error = std::io::Error>,
 ) -> Result<(), crate::Error> {
     transport_outgoing_frames_actor(transport_rx, outgoing_lines).await
@@ -227,7 +313,7 @@ pub(super) async fn transport_incoming_lines_actor(
     let mut incoming_lines = pin!(incoming_lines);
     while let Some(line_result) = incoming_lines.next().await {
         let line = line_result.map_err(crate::Error::into_internal_error)?;
-        tracing::trace!(message = %line, "Received JSON-RPC message");
+        tracing::trace!(message = %crate::util::redacted_json_line(&line), "Received JSON-RPC message");
 
         match parse_incoming_line(&line) {
             ParsedIncomingLine::Single(message) => {
@@ -256,6 +342,56 @@ mod tests {
 
     use super::*;
     use crate::ErrorCode;
+
+    #[derive(Default)]
+    struct PendingCloseWriter {
+        bytes: Vec<u8>,
+        close_polls: usize,
+    }
+
+    impl futures::AsyncWrite for PendingCloseWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.bytes.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            assert_eq!(self.close_polls, 0, "do not flush again during shutdown");
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.close_polls += 1;
+            if self.close_polls == 1 {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+    }
+
+    #[test]
+    fn byte_writer_flushes_then_continues_pending_shutdown_without_reflushing() {
+        use futures::SinkExt as _;
+        let mut sink = LineWriter::new(PendingCloseWriter::default());
+        futures::executor::block_on(async {
+            sink.send("line".to_string()).await.unwrap();
+            sink.close().await.unwrap();
+        });
+        assert_eq!(sink.writer.bytes, b"line\n");
+        assert_eq!(sink.writer.close_polls, 2);
+    }
 
     #[test]
     fn parses_batch_entries_independently() {

@@ -79,8 +79,8 @@ Agent
 When v2 mode is enabled, application code should use types from
 `agent_client_protocol::schema::v2`. The flat `agent_client_protocol::schema::*`
 exports remain the stable v1 schema. This will likely change as v2 gets closer
-to release. The preceding agent fragment demonstrates version negotiation only;
-an agent that advertises session support must also implement the complete
+to release. The preceding agent fragment demonstrates version negotiation only.
+An agent that advertises session support must also implement the complete
 baseline session surface shown in the runnable quickstart.
 
 ## High-level v2 sessions
@@ -92,7 +92,7 @@ the v2 `build_session*` and `resume_session*` helpers, plus feature-gated
 `fork_session*` helpers when `unstable_session_fork` is enabled. The shared
 names describe the same lifecycle operations while the connection type selects
 their schema and return types at compile time. Resume and fork return
-`V2ResumeSessionBuilder` and `V2ForkSessionBuilder`; call `start_session` to
+`V2ResumeSessionBuilder` and `V2ForkSessionBuilder`. Call `start_session` to
 publish the request and obtain an `OpenedV2Session` containing the command
 handle and complete operation-specific response.
 
@@ -108,7 +108,7 @@ the same low-level `HandleDispatchFrom` interface and therefore also receive
 
 Nested connections preserve the stable `ConnectionTo` API while still typing
 the child implementation's callbacks. On a raw `ConnectionTo<_>`,
-`spawn_connection(Client.v2(), transport)` returns a raw `ConnectionTo<_>`;
+`spawn_connection(Client.v2(), transport)` returns a raw `ConnectionTo<_>`, and
 callbacks installed on that v2 child builder still receive
 `V2ConnectionTo<_>`. Existing `spawn_connection::<Role>` calls therefore remain
 source-compatible.
@@ -133,10 +133,10 @@ V2 deliberately separates prompt submission from session observation:
 
 - `session/prompt` returns a `PromptResponse` as soon as the agent accepts the
   prompt. Its `message_id` identifies the inserted user message, and live
-  `UserMessage` updates for that prompt use the same ID; persisting the message
+  `UserMessage` updates for that prompt use the same ID. Persisting the message
   in resumable history remains optional. The response does not indicate turn
   completion. `V2Session::send_prompt` returns that request as a
-  `SentRequest<PromptResponse>`; callers must explicitly await it, register a
+  `SentRequest<PromptResponse>`. Callers must explicitly await it, register a
   response callback, or detach it.
 - `V2SessionBuilder::start_session` likewise returns a mapped `SentRequest`.
   Its `OpenedV2Session` result keeps the command handle separate from the
@@ -154,28 +154,43 @@ V2 deliberately separates prompt submission from session observation:
   connection. It does not own, buffer, or unregister inbound messages.
 - Register typed `UpdateSessionNotification` and `RequestPermissionRequest`
   handlers on `Client.v2()` before connecting. Updates and interactive requests
-  are separate protocol lanes; permission handlers should transfer responders
+  are separate protocol lanes. Permission handlers should transfer responders
   to application-owned work rather than waiting for user input inside the
   connection dispatch loop. Without matching handlers, unhandled v2
   notifications are ignored and unhandled requests receive a method-not-found
-  response; they are not retained for a later per-session receiver.
+  response. They are not retained for a later per-session receiver.
 - `session/update` events can arrive before, during, or after a prompt request.
   They carry a session ID and entity IDs, but no prompt or turn ID. The SDK
   therefore does not attribute intervening events to a locally submitted
   prompt or provide a prompt-scoped text accumulator.
 - `state_update` describes the session-wide foreground state. `idle` means the
-  session can accept ordinary new foreground work; it is not a wire-level
+  session can accept ordinary new foreground work. It is not a wire-level
   boundary assigning previous events to one prompt, and background updates may
   continue while idle.
-- `cancel_active_work` sends session-wide `session/cancel`. Cancellation
-  completes after the required `idle` update with stop reason `cancelled`. The
-  client should immediately mark unfinished tool calls for the active work as
-  cancelled and must resolve every pending permission request with the
-  cancelled outcome. Cancelling or dropping the prompt's `SentRequest` is the
-  separate JSON-RPC request-cancellation mechanism.
-- `set_config_option` returns the authoritative replacement option set, and
-  `close` returns the complete close response. Mutable configuration is not
-  cached on the command handle.
+- `cancel_active_work` sends session-wide `session/cancel`. It covers the
+  session's foreground work and any prompts the agent has not yet inserted;
+  those prompt requests fail with `-32800` (request cancelled), while a prompt
+  whose user message was already inserted still succeeds with its message ID.
+  Background activity is not covered, although the agent may stop it too.
+  Cancellation of active foreground work completes after the required `idle`
+  update with stop reason `cancelled`; cancelling an idle session need not
+  emit another completion. `cancelled` is reserved for work the client
+  cancelled with `session/cancel` or by closing the session; work the agent
+  stops on its own uses another reason, such as `error`. The client should immediately mark unfinished tool calls for the active work as
+  cancelled and must resolve every pending permission request in that session
+  with the cancelled outcome, without answering twice or affecting other
+  sessions. Elicitations are not all cancelled implicitly: agents should use
+  individual `$/cancel_request` for interactions made irrelevant by the
+  cancelled work. Cancelling or dropping the prompt's `SentRequest` is the
+  separate JSON-RPC request-cancellation mechanism; insertion still requires a
+  successful prompt response with its message ID.
+- `set_config_option` must only name a `configId` the agent advertised for
+  the session. An unknown `configId` or invalid value fails with `-32602` and
+  leaves the configuration unchanged. A successful response is the
+  authoritative replacement option set for the requesting client, even though
+  a duplicate `config_option_update` notification for the same change may
+  arrive before it. `close` returns the complete close response. Mutable
+  configuration is not cached on the command handle.
 
 Install connection handlers before `session/new`, `session/resume`, and
 feature-gated `session/fork` requests. This is especially important before
@@ -197,12 +212,12 @@ session configured with `V2SessionBuilder::with_mcp_server` or
 `V2ForkSessionBuilder::with_mcp_server`, the SDK installs the MCP routes and
 initially polls their runner tasks before publishing the corresponding setup
 request, so the agent can connect to those servers during setup or resume
-replay. Runners may continue asynchronous initialization; custom connectors
+replay. Runners may continue asynchronous initialization, so custom connectors
 must be able to queue connections and messages once constructed. A successful
-setup promotes the attachment to the connection lifetime; a setup failure,
+setup promotes the attachment to the connection lifetime. A setup failure,
 including an error response after cancellation, cleans up the pending
 attachment. This attachment requires both `unstable_protocol_v2` and
-`unstable_mcp_over_acp`; fork additionally requires
+`unstable_mcp_over_acp`. Fork additionally requires
 `unstable_session_fork`.
 
 A v2 proxy can instead attach one server globally with
@@ -246,7 +261,7 @@ source session ID. For `session/resume`, the ID is already known, so routing and
 MCP attachment are ready before the downstream request is published. Replay
 updates can therefore be forwarded upstream before the complete
 `ResumeSessionResponse`, as required by the protocol. A failed or cancelled
-downstream response drops pending routing and MCP attachment; successful setup
+downstream response drops pending routing and MCP attachment. Successful setup
 keeps them for the connection lifetime. A cancellation signal itself remains
 advisory: it is forwarded downstream while the helper awaits that response.
 Each helper then spawns the callback outside the ordering barrier with an
@@ -292,17 +307,17 @@ compatible version is canonicalized through the selected v2 schema before
 component instantiation.
 
 Proxy implementations use
-`agent_client_protocol::schema::v2::InitializeProxyRequest`; its response is the
+`agent_client_protocol::schema::v2::InitializeProxyRequest`. Its response is the
 v2 `InitializeResponse`. The flat `schema::InitializeProxyRequest` remains the
 stable v1 type. Static conductor component providers can carry either selected
 schema, but each supplied component must support that version. Use
 `Agent.protocol_router()` or `Proxy.protocol_router()` when a static component
 has separate implementations.
 Custom `InstantiateProxiesAndAgent` and `InstantiateProxies` implementations
-opt into v2 by implementing their feature-gated v2 method; the default rejects
+opt into v2 by implementing their feature-gated v2 method. The default rejects
 v2 rather than interpreting it as v1. Returning the initialize request
 unchanged preserves its complete raw parameters for an exact-version request,
-including unknown extensions; returning a modified typed request makes that
+including unknown extensions. Returning a modified typed request makes that
 serialized request authoritative. The conductor pins `protocolVersion` to its
 selected implementation even if an instantiator attempts to change it, and
 validates the final agent's initialize response against that selection.
@@ -325,22 +340,78 @@ This feature extends the concrete compatibility proxy only. The core SDK's
 global MCP attachment and proxy-session helpers support v1 and v2 independently,
 as described above.
 
+## Version routing
+
 The SDK handles the `initialize` negotiation at the JSON-RPC boundary:
 
 - Native `Client.v2()` and `Agent.v2()` connections reject ordinary protocol
-  traffic until the initialization response completes; `$/cancel_request`
+  traffic until the initialization response completes. `$/cancel_request`
   remains available while initialization is in progress. The client is the
-  initializer and the agent is the responder; attempts in the opposite
+  initializer and the agent is the responder. Attempts in the opposite
   direction are rejected. An initialization error leaves the connection
-  uninitialized so the client can retry, while a second initialization after a
-  successful handshake is rejected.
+  uninitialized so the client can retry. A second `initialize` while one is in
+  flight is rejected with `-32600`.
+- The client may repeat `initialize` after the previous one completed and
+  before it sends any other request, for example to resend its parameters for
+  the version the agent selected. The agent dispatches each repeat to its
+  initialize handler and the latest one is authoritative. While a repeat is in
+  flight, other requests are rejected as they are during the first. A repeat
+  requesting a version below the selected one is rejected with `-32600`. A
+  repeat that fails, whether rejected by the SDK or by the handler, keeps the
+  previous initialization in place and the client may repeat again. The first
+  other request closes this window: a later `initialize` is rejected with
+  `-32600` on both sides and the connection stays ready. Notifications such as
+  `$/cancel_request` do not close it.
+- V2 request ids must be strings or integers. A v2 connection answers a request
+  with a `null` id with `-32600` and `id: null`. V1 connections still accept
+  `null` ids.
+- Since schema 1.13, v2 has its own `schema::v2::RequestId` without a `Null`
+  variant. The `id()` accessors on `PreparedRequest`, `SentRequest`,
+  `Responder`, `ResponseRouter`, and `Dispatch` keep returning the
+  version-neutral `schema::v1::RequestId`. Use `v2_id()` for the v2 form, for
+  example to match an elicitation's `requestId`. It returns the ID directly for
+  requests the SDK sends, since the SDK never assigns `null`. For `Responder`
+  and `Dispatch` it returns an `Option` that is `None` only for a `null` ID,
+  which can only reach a handler on a v1 connection.
 - A v2 client advertises protocol v2 as its latest supported version.
-- A v2 client requires a v2 agent. If the agent responds with v1, the
-  `initialize` request resolves with an error and the caller must explicitly
-  fall back to a v1 client implementation if that is acceptable.
-- A v2 agent requires a v2 client. If a client initializes with v1, the
-  `initialize` request resolves with an error and the caller must use a v1
-  agent implementation instead.
+- A v2 client requires a v2 agent. Send initialization with
+  `send_initialize` to learn how the agent negotiated: it resolves with
+  `InitializeOutcome::Initialized` for a v2 selection, or
+  `InitializeOutcome::LowerVersion` with the agent's validated response for the
+  selected version (`SelectedInitializeResponse::V1`). After a lower
+  selection the connection stays uninitialized, and the caller can explicitly
+  fall back to a v1 client implementation if that is acceptable. Errors
+  returned by the agent, including `-32022`, malformed responses, and transport
+  failures still resolve with errors. A plain `send_request` of the initialize
+  request instead resolves a v1 selection with a local error.
+- A native v1 agent selects v1 for requests advertising v1 or a newer version,
+  with or without `unstable_protocol_v2` enabled. Newer initialization metadata
+  is normalized into v1 identity and shared capabilities. Terminal
+  authentication is kept: an object-valued `auth.terminal` becomes v1's
+  `auth.terminal: true`. Elicitation capabilities and an object `_meta` are
+  kept when they parse under v1. The SDK never enables v1 file-system or
+  terminal-execution capabilities from unknown newer fields.
+  V1's original fallback-to-latest rule is retained, including a v1 selection
+  when the client requests an unsupported older version.
+- A v1 agent that registers a typed `initialize` request handler rejects any
+  other request that arrives before initialization completes with `-32600`.
+  Agents without one, including those with only catch-all handlers, keep
+  serving requests without initialization. V1 agents still accept a repeated
+  `initialize` at any time.
+- A standalone v2 agent accepts a request for v2 or a newer version and
+  selects v2. The request delivered to the handler has `protocol_version`
+  normalized to v2, and the response selects v2. A request for exactly v2 must
+  be a valid v2 request. A request for a newer version was written for a
+  version the agent doesn't know, so the SDK keeps what parses under v2
+  instead of rejecting it: capabilities that don't parse and a `_meta` that is
+  not an object are dropped, fields v2 doesn't define are dropped, and a
+  missing or malformed `info` is replaced by an implementation named `unknown`
+  with version `unknown`. A v1 agent downgrading a newer request applies the
+  same rule to v1's shape, leaving its optional `clientInfo` unset instead. If a client initializes with v1, the request resolves with
+  `-32022` (`Unsupported protocol version`) and
+  `data: { "requested": 1, "supported": [2] }`. The v2 initialization handler
+  is not invoked. Use an agent router with a v1 implementation to serve v1
+  sessions.
 - If the agent responds with any other unsupported version, the request resolves
   with an error so the client can close the connection.
 - After initialization, the local API version and negotiated wire version must
@@ -351,6 +422,14 @@ That means v1 and v2 implementations still need separate handlers.
 stabilizes, the `unstable_protocol_v2` crate feature also exposes
 `Agent.protocol_router()`, `Proxy.protocol_router()`, and
 `Client.protocol_connector()` for composing version-specific implementations.
+
+Keep these protocol handlers as adapters around shared application logic, not
+as general-purpose conversions between wire types. In particular, v1 prompt
+responses end a turn, while v2 prompt responses acknowledge insertion and
+completion arrives through session state updates. Shared storage also does not
+automatically make sessions resumable through both versions. See the protocol's
+[dual-stack migration guidance](https://agentclientprotocol.com/protocol/v2/migration#supporting-v1-and-v2-side-by-side)
+for adapter boundaries and a validation checklist.
 
 Agents can add protocol implementations independently, which makes it easy for
 applications built with v2 support to control v2 rollout with a runtime feature
@@ -397,15 +476,47 @@ agent
 # }
 ```
 
-The agent protocol router reads the initial `initialize` request, selects the
-highest configured protocol version that is compatible with the requested
-version, and then hands the connection to that implementation. If only v2 is
-configured, v1 clients are rejected without changing the fluent API. The router
+The agent protocol router reads the initial `initialize` request and selects
+a version-specific implementation. Endpoints exposing v2 select the highest
+configured version at or below the requested version, or reject initialization
+with a structured version-mismatch error if none exists. V1-only endpoints
+retain v1's original fallback-to-latest rule. The router
 normalizes a v2 initialize request when selecting a v1 implementation, but does
-not convert messages between v1 and v2 after routing. For compatibility, the
-initial frame may be a batch whose first call-shaped entry is `initialize`; the
+not convert messages between v1 and v2 after routing. The selected
+implementation owns the connection: a repeated `initialize` is forwarded to it
+and never re-routed, so it is evaluated against the selected version. A v2
+implementation rejects a repeat that requests v1 with `-32600`, and a v1
+implementation selects v1 for a repeat that requests a newer version. For compatibility, the
+initial frame may be a batch whose first call-shaped entry is `initialize`. The
 router preserves the complete frame when handing it to the selected
 implementation. Response-only frames before initialization are ignored.
+
+### Version mismatch errors
+
+A v2-only endpoint rejects a v1 request without requiring v2's Client identity
+or manufacturing a higher-version success response. The error code is
+`-32022`, and its data contains `requested` and the endpoint's `supported`
+versions. This diagnostic is separate from malformed initialization parameters,
+which remain `-32602`. The router preserves response IDs and batch framing,
+flushes the rejection, and closes without starting the selected application.
+
+Custom endpoints can construct the same wire error with
+`agent_client_protocol::util::unsupported_protocol_version(requested, supported)`.
+The code is defined by v2 negotiation, not by a change to the v1 protocol.
+The shared SDK error model can preserve it as an unknown numeric code, so a
+legacy v1 client can handle the initialization error without new v1 schema
+definitions.
+
+`just test` runs the negotiation tests in both the all-features workspace and
+the core crate without default features, so v1 negotiation does not depend on
+whether the draft v2 API is compiled in.
+
+Clients should close after a version mismatch and display the supported
+versions. A successful downgrade must also be checked against the Client's
+actual supported versions, because advertising a latest version does not imply
+support for every older version.
+
+### Proxy and client routing
 
 The proxy protocol router reads `_proxy/initialize` after the conductor has
 selected the chain's wire version. It therefore requires an exact configured
@@ -446,11 +557,11 @@ The reuse probe is conservative: if parsing and serializing the raw v2 request
 would change any parameter, reuse is disabled and fallback opens a fresh
 connection. That does not turn an otherwise valid v2 request into an error.
 
-## Schema changes in schema 1.5 through 1.8
+## Schema changes in schema 1.5 through 1.13
 
 The `unstable_protocol_v2` API follows the moving draft schema. Schema 1.5 added
-semantic newtypes for paths, media types, IDs, and cursors; renamed
-`DiffPatch.diff` to `DiffPatch.text`; and added terminal state and output update
+semantic newtypes for paths, media types, IDs, and cursors, renamed
+`DiffPatch.diff` to `DiffPatch.text`, and added terminal state and output update
 types. Schema 1.7 removed the former schema-wide v1/v2 conversion API:
 versioned implementations should remain separate, with
 purpose-specific adapters at runtime boundaries where the required state and
@@ -462,13 +573,185 @@ Schema 1.6 adds `Cancelled` tool-call and plan-entry statuses to draft v2.
 
 Schema 1.7 stabilizes elicitation and terminal authentication, so neither
 surface requires its former SDK feature flag. It also adds context compaction
-updates behind `unstable_session_compaction`; the SDK carries them through its
+updates (stable since schema 1.11). The SDK carries them through its
 existing typed `session/update` routing in both protocol versions. V1 clients
 advertise compaction support through `ClientSessionCapabilities::compaction`.
 
 Schema 1.8 stabilizes optional programmatic tool-call names in both protocol
-versions. No tool-name-specific feature is required; draft v2 users only need
+versions. No tool-name-specific feature is required. Draft v2 users only need
 `unstable_protocol_v2`. In v1, an omitted or `null` name leaves the existing
 value unchanged on updates. In v2, omission leaves it unchanged, `null` clears
 it, and a string replaces it. V1 cannot express the explicit v2 `null` clear
 operation.
+
+Schema 1.11 stabilizes session notices and compaction. No surface-specific
+feature is required. Draft v2 users still need `unstable_protocol_v2`.
+
+In draft v2, failures after a prompt's user message is inserted end active work
+with `StopReason::Error(ErrorStopReason)` on the idle state update, optionally
+including a JSON-RPC error object. Failures before insertion remain error
+responses to `session/prompt`. `StopReason` now serializes as an object tagged
+by `stopReason`, flattened into `IdleStateUpdate`. Its `Other` variant takes
+`OtherStopReason` rather than a string and preserves unknown payload fields.
+V1 prompt responses are unchanged and do not accept an `error` stop reason.
+
+Schema 1.11 also rejects malformed payloads that receivers act on rather than
+silently dropping invalid entries or substituting defaults. This includes
+session setup's MCP servers and additional directories, terminal launch
+arguments and environment, and v2 replay cursors. Typed request decoding
+reports invalid parameters (`-32602`) without invoking the handler. `null`
+still means empty for the defaultable acted-on lists. Omission is accepted
+only where the field is optional. Capability and display metadata retain their
+lenient decoding.
+
+### Schema 1.12
+
+Client-provided system prompts are available through the independent
+`unstable_session_system_prompt` feature. Use the complete lifecycle request
+with `_from` helpers and negotiate the agent's capability first; see
+[Client-provided system prompts](./protocol.md#client-provided-system-prompts).
+Next Edit Suggestions, their document events, and their position-encoding
+capabilities have been removed from both protocol versions.
+
+Foreground states are aggregate snapshots, not per-prompt events:
+
+- Report `running` when work starts, or `requires_action` if it starts blocked
+  on user action. Agent-initiated workflows and local commands use the same
+  lifecycle without needing a model call or a synthetic user prompt.
+- `requires_action` means the foreground workflow as a whole is blocked.
+  A pending permission or elicitation does not imply this state while other
+  foreground work can progress or when it belongs to background activity.
+  Once reported, send `running` when progress resumes or `idle` when work ends.
+- When no foreground work remains, report `idle`; normally include a stop
+  reason. Repeated snapshots, including an old stop reason, are idempotent,
+  not additional completions, cancellations, or token usage.
+- New sessions default to idle, but updates can precede the new-session
+  response. Do not overwrite them with idle when that response arrives.
+- Every successful resume must send a current-state snapshot after any replay
+  and before its response, even without a replay cursor. Do not replay
+  historical states as live activity or reset state to idle on the response.
+  Testy and the echo example only resume sessions without foreground work, so
+  their snapshot is idle without a new stop reason.
+- A resume should also return the current `configOptions` in its response and
+  send current session info through `session_info_update` after any replay and
+  before responding. Like the state snapshot, this synchronizes current state
+  rather than replaying historical configuration or metadata changes.
+
+Prompt acceptance means logical user-message insertion with an ID and a
+position, not receipt or queueing. Running may precede insertion. Rejection
+before insertion requires an error response and no user-message updates for
+that submission; it does not alone end foreground work. A pre-insertion
+foreground failure can also require an error idle update. After insertion,
+the response stays successful and failure is reported on idle instead.
+This includes authentication failures: after insertion, `auth_required`
+(`-32000`) belongs in the error stop reason, not an error prompt response.
+Authenticating again does not restart ended work, and automatically retrying
+an inserted prompt would insert another message and could repeat side effects.
+When closing cancels active work, final updates and idle with `cancelled`
+precede the close response. An uninserted prompt cancelled by close gets
+`-32800`; an inserted one still gets its successful message ID.
+
+Agents reject unsupported replay cursor types with `-32602`, rather than
+substituting another cursor. Retained user messages preserve the prompt
+response's ID across replay. Agent and thought message IDs may change across
+reconnections: rebuild that history on full replay instead of deduplicating
+only by ID. A chunk replay's empty-content primer clears only its replay ID.
+
+Top-level `_meta` on upsert updates patches stored metadata by key: omission
+leaves it unchanged, `null` clears it, and an object preserves omitted keys,
+removes keys whose values are `null`, and replaces each other value whole.
+Nested objects are not merged; nested nulls are ordinary data. An empty object
+does not clear metadata. Replay uses the same rules and never implicitly resets
+metadata. `ToolCallUpdate::apply_update` and `TerminalUpdate::apply_update`
+apply this rule; use `schema::v2::apply_meta_update` for application-owned
+message, session, compaction, or subagent projections. Metadata on chunks,
+content, snapshots, and `plan_update` is not an entity patch.
+
+Protocol v2 negotiation does not select every experimental feature. Operations
+such as provider configuration require their advertised capabilities.
+Informational notices, compaction, draft plan representations, subagent
+updates, and idle token usage can use their documented capability-free
+fallbacks; accepting an unknown variant is not a support advertisement.
+Unknown capability fields are ignored, while malformed known discriminators
+must not fall through to an unknown-variant fallback.
+
+Client projections of tool calls and terminals should follow these rules:
+
+- `tool_call_update` is an upsert keyed by `toolCallId`. On an existing tool
+  call, omission leaves a field unchanged and `null` resets it to its default.
+  A new ID starts from the defaults: `kind` is `other`, `status` is `pending`,
+  `content` and `locations` are empty, and `title`, `name`, `rawInput`, and
+  `rawOutput` are unset. Show a generic title while `title` is unset.
+- Treat a tool call whose `status` is unrecognized as still in progress.
+- A `tool_call_content_chunk` for a `toolCallId` the client has not seen
+  creates the tool call with those defaults and then appends. Likewise a
+  `terminal_output_chunk` for an unseen `terminalId` creates the terminal with
+  unknown fields and empty output, then appends.
+- Decode each terminal chunk independently and append the bytes in order.
+  Ignore a chunk or `output` snapshot whose `data` is not valid base64,
+  keeping the bytes already held; the rest of that `terminal_update` still
+  applies. Agents should send all output before a
+  concrete `exitStatus`, but clients still append output that arrives after
+  it. Clients may cap how much output they retain, for example by dropping the
+  oldest bytes; a later `output` snapshot replaces whatever they kept.
+- In a diff, `changes` is authoritative for affected paths and operations.
+  Follow `changes` when `patch` disagrees with it, and handle diffs without a
+  `patch`.
+
+For v2 `git_patch` diffs, every path must be absolute and have no `a/` or `b/`
+prefix, including rename/copy header paths. Git quoting and `/dev/null` for
+an added/deleted file's missing side still apply. Configure diff parsers not to
+strip a leading path component, since that would drop part of an absolute
+path, and take paths from `changes` or from the `---`, `+++`, rename, and copy
+lines rather than by splitting the `diff --git` header. The SDK carries patch
+text; it does not rewrite paths or compute diffs from snippets.
+
+### Schema 1.13
+
+Draft v2 type changes:
+
+- v2 has its own `RequestId`, `Request`, and `Response` types. Request IDs are
+  a string or an integer, never `null`; error responses may still use `null`
+  when the request ID could not be determined.
+- `AvailableCommand` is a `type`-tagged union. Build commands with
+  `AvailableCommand::Command(Command::new(..))` and read them through
+  `name()`, `description()`, and `meta()`. Unknown command kinds parse as
+  `Other`; show them as plain commands by name and description, or ignore them.
+- `ToolCallLocation.line` is a 1-based `NonZeroU32`. The builder still takes a
+  `u32` and treats `0` as no line.
+- `TerminalExitStatus.exit_code` is an `i64` holding the code the platform
+  reports, so negative codes such as Windows NTSTATUS values survive.
+- `ResourceLink.size` is a `u64` byte count; a negative value parses as unknown.
+- `terminal_update` has an optional `size` with `cols` and `rows`, patched like
+  the other terminal fields. Clients should render the output at that size
+  when it is present.
+- `RequestPermissionOutcome::Cancelled` carries a `CancelledPermissionOutcome`
+  with optional `_meta`; `{"outcome": "cancelled"}` still parses.
+  `AuthCapabilities` is now `ClientAuthCapabilities`.
+- `DiffPatch`, `ToolCallPermissionSubject`, and `Icon` gain a `_meta` field
+  (`meta`).
+- Unknown variants keep their optional fields verbatim in `fields`.
+
+`V2SessionBuilder::with_mcp_server`, `V2ResumeSessionBuilder::with_mcp_server`,
+`V2ForkSessionBuilder::with_mcp_server`, and `Proxy.v2().with_mcp_server`
+declare an `McpServer::Acp` server. The agent must advertise
+`session.mcp.acp` to accept it; otherwise a conforming agent rejects the setup
+request with `-32602`. When the downstream agent only supports another MCP
+transport, place a compatibility proxy such as `McpOverAcpPolyfill` in front of
+it. The SDK does not check the agent's capability before sending the
+declaration.
+
+Client projections should also follow these rules:
+
+- A `state_update` with an unrecognized state never means idle. Show a generic
+  busy state until a known state arrives.
+- An update or chunk for an unseen message ID creates the message. Its first
+  update or chunk fixes its timeline position; later updates patch it in
+  place, even after idle. Updates for different entities may interleave, and a
+  new ID does not end any other entity.
+- Show an unrecognized tool `kind` as `other`.
+- A `tool_call` permission subject applies to the stored tool call exactly like
+  a `tool_call_update`, in the order received and before the prompt is shown. A
+  first-seen `toolCallId` creates the tool call.
+- The Agent owns remembered `allow_always` and `reject_always` decisions and
+  their scope. Clients do not infer that scope from the option kind.

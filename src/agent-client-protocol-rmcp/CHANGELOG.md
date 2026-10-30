@@ -7,11 +7,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.6](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v4.0.5...agent-client-protocol-rmcp-v4.0.6) - 2026-10-28
+
+### Other
+
+- updated the following local packages: agent-client-protocol
+
+## [4.0.5](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v4.0.4...agent-client-protocol-rmcp-v4.0.5) - 2026-10-22
+
+### Other
+
+- updated the following local packages: agent-client-protocol
+
+## [4.0.4](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v4.0.3...agent-client-protocol-rmcp-v4.0.4) - 2026-10-16
+
+### Other
+
+- updated the following local packages: agent-client-protocol
+
+## [4.0.3](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v4.0.2...agent-client-protocol-rmcp-v4.0.3) - 2026-10-09
+
+### Other
+
+- updated the following local packages: agent-client-protocol
+
+## [4.0.2](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v4.0.1...agent-client-protocol-rmcp-v4.0.2) - 2026-10-08
+
+### Other
+
+- updated the following local packages: agent-client-protocol
+
+## [4.0.1](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v4.0.0...agent-client-protocol-rmcp-v4.0.1) - 2026-10-07
+
+### Other
+
+- updated the following local packages: agent-client-protocol
+
+## [4.0.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v3.1.1...agent-client-protocol-rmcp-v4.0.0) - 2026-10-06
+
+### Added
+
+- *(acp)* [**breaking**] make native transports and schema support opt-in ([#397](https://github.com/agentclientprotocol/rust-sdk/pull/397))
+- *(acp)* [**breaking**] adopt request-scoped MCP binding ([#388](https://github.com/agentclientprotocol/rust-sdk/pull/388))
+- *(rmcp)* [**breaking**] upgrade integration to rmcp 3.4
+- *(acp)* make schemars optional ([#373](https://github.com/agentclientprotocol/rust-sdk/pull/373))
+
+### Other
+
+- prepare v3 package metadata and release guidance ([#404](https://github.com/agentclientprotocol/rust-sdk/pull/404))
+- slim dependency features and CI validation ([#399](https://github.com/agentclientprotocol/rust-sdk/pull/399))
+- reconcile combined breaking release migrations ([#395](https://github.com/agentclientprotocol/rust-sdk/pull/395))
+
 ### Breaking changes
 
-- Upgrade the public `rmcp` dependency from 2.x to 3.4. This requires the next
-  major release of `agent-client-protocol-rmcp` (4.x), while the core ACP SDK
-  remains on 2.x. Services supplied to `McpServer::from_rmcp` must use rmcp 3.x.
+- Native attachments use request-scoped MCP 2026-07-28 and inner outcome
+  carriers, replacing the old `mcp/connect` / `mcp/disconnect` binding without
+  a legacy fallback. `from_rmcp` lazily creates one reusable service for native
+  requests; standalone connections retain per-connection factories and rmcp
+  protocol negotiation. See the
+  [native binding migration](https://agentclientprotocol.github.io/rust-sdk/migration-stateless-mcp.html)
+  and [request-scoped MCP guide](https://agentclientprotocol.github.io/rust-sdk/mcp-over-acp.html).
+- Release `agent-client-protocol-rmcp` 4.x together with core ACP 3.x and the
+  public `rmcp` dependency upgrade from 2.x to 3.4. Migrate both public
+  dependencies together. Services supplied to `McpServer::from_rmcp` must use
+  rmcp 3.x; custom transports and low-level callers must follow the core
+  [connection-driver migration](https://agentclientprotocol.github.io/rust-sdk/migration-connection-drivers.html).
 - Adapt tool handlers to rmcp's `CallToolResponse`, use `ServerConfig` in place
   of the deprecated `ServerInfo` alias, and remove legacy tool-execution
   metadata. See the [migration guide](https://agentclientprotocol.github.io/rust-sdk/migration-rmcp-v4.html).
@@ -20,8 +80,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Integration coverage for MCP 2026-07-28 requests without initialization,
   discovery, per-request metadata/version validation, and MRTR results from
-  caller-supplied rmcp services. This dependency upgrade does not replace the
-  current unstable MCP-over-ACP wire lifecycle.
+  caller-supplied rmcp services.
+- Add supervised native execution, request-scoped cancellation/notification
+  context, borrowed tool cleanup acknowledgments, and a runnable direct ACP
+  example. Independent `unstable_protocol_v2` and `unstable_mcp_over_acp`
+  features forward their respective core gates; the v2 native example
+  explicitly requires both.
+
+### Changed
+
+- Request tokio-util's cancellation-token support explicitly for native MCP
+  attachments. Keep production compatibility adapters and JSON Schema tool
+  builders; remove unused JSON log formatting from example dependencies.
+- Keep Tokio stdio, the multithreaded runtime, and rmcp macros out of production
+  dependencies. Native examples and tests enable them separately. The integration
+  library now compiles for `wasm32-wasip1` and `wasm32-wasip2` with default or all
+  features; applications still supply a compatible runtime and host transport.
 
 ## [3.1.1](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-rmcp-v3.1.0...agent-client-protocol-rmcp-v3.1.1) - 2026-09-18
 

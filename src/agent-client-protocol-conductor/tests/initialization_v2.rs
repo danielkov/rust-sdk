@@ -13,7 +13,7 @@ use agent_client_protocol::{
 use agent_client_protocol_conductor::{
     ConductorImpl, InstantiateProxies, InstantiateProxiesAndAgent, ProxiesAndAgent,
 };
-use futures::{StreamExt as _, channel::mpsc};
+use futures::{FutureExt as _, StreamExt as _, channel::mpsc};
 use serde::{Deserialize, Serialize};
 use tokio::io::duplex;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
@@ -237,51 +237,55 @@ impl ConnectTo<Conductor> for RecordingPassthroughProxy {
     }
 }
 
-async fn run_with_conductor(
+fn run_with_conductor(
     components: impl InstantiateProxiesAndAgent + 'static,
     editor_task: impl AsyncFnOnce(V2ConnectionTo<Agent>) -> Result<(), Error>,
-) -> Result<(), Error> {
-    let (editor_out, conductor_in) = duplex(4096);
-    let (conductor_out, editor_in) = duplex(4096);
-    let transport = ByteStreams::new(editor_out.compat_write(), editor_in.compat());
+) -> impl std::future::Future<Output = Result<(), Error>> {
+    Box::pin(async move {
+        let (editor_out, conductor_in) = duplex(4096);
+        let (conductor_out, editor_in) = duplex(4096);
+        let transport = ByteStreams::new(editor_out.compat_write(), editor_in.compat());
 
-    Client
-        .v2()
-        .name("v2-editor")
-        .with_spawned(|_cx| async move {
-            ConductorImpl::new_agent("v2-conductor", components)
-                .run(ByteStreams::new(
-                    conductor_out.compat_write(),
-                    conductor_in.compat(),
-                ))
-                .await
-        })
-        .connect_with(transport, editor_task)
-        .await
+        Client
+            .v2()
+            .name("v2-editor")
+            .with_spawned(|_cx| async move {
+                ConductorImpl::new_agent("v2-conductor", components)
+                    .run(ByteStreams::new(
+                        conductor_out.compat_write(),
+                        conductor_in.compat(),
+                    ))
+                    .await
+            })
+            .connect_with(transport, editor_task)
+            .await
+    })
 }
 
-async fn run_raw_client_with_conductor(
+fn run_raw_client_with_conductor(
     components: ProxiesAndAgent,
     editor_task: impl AsyncFnOnce(ConnectionTo<Agent>) -> Result<(), Error>,
-) -> Result<(), Error> {
-    let (editor_out, conductor_in) = duplex(4096);
-    let (conductor_out, editor_in) = duplex(4096);
-    let transport = ByteStreams::new(editor_out.compat_write(), editor_in.compat());
+) -> impl std::future::Future<Output = Result<(), Error>> {
+    Box::pin(async move {
+        let (editor_out, conductor_in) = duplex(4096);
+        let (conductor_out, editor_in) = duplex(4096);
+        let transport = ByteStreams::new(editor_out.compat_write(), editor_in.compat());
 
-    Client
-        .builder()
-        .without_acp_version_guard()
-        .name("raw-v2-editor")
-        .with_spawned(|_cx| async move {
-            ConductorImpl::new_agent("v2-conductor", components)
-                .run(ByteStreams::new(
-                    conductor_out.compat_write(),
-                    conductor_in.compat(),
-                ))
-                .await
-        })
-        .connect_with(transport, editor_task)
-        .await
+        Client
+            .builder()
+            .without_acp_version_guard()
+            .name("raw-v2-editor")
+            .with_spawned(|_cx| async move {
+                ConductorImpl::new_agent("v2-conductor", components)
+                    .run(ByteStreams::new(
+                        conductor_out.compat_write(),
+                        conductor_in.compat(),
+                    ))
+                    .await
+            })
+            .connect_with(transport, editor_task)
+            .await
+    })
 }
 
 async fn assert_invalid_final_agent_initialize_response(
@@ -321,8 +325,10 @@ async fn assert_invalid_final_agent_initialize_response(
 async fn assert_raw_initialize_rejected(
     params: serde_json::Value,
     expected_error: &str,
+    expected_code: i32,
 ) -> Result<(), Error> {
     run_raw_client_with_conductor(ProxiesAndAgent::new(Agent.v2()), async move |cx| {
+        let requested = params.get("protocolVersion").cloned();
         let request = UntypedMessage {
             method: "initialize".to_string(),
             params,
@@ -334,6 +340,16 @@ async fn assert_raw_initialize_rejected(
         .await
         .expect("invalid initialize request should not hang")
         .expect_err("invalid initialize request must be rejected");
+        assert_eq!(i32::from(error.code), expected_code);
+        if expected_code == -32022 {
+            assert_eq!(
+                error.data,
+                Some(serde_json::json!({
+                    "requested": requested.expect("a version mismatch has a requested version"),
+                    "supported": [1, 2],
+                }))
+            );
+        }
         assert!(
             error.to_string().contains(expected_error),
             "unexpected initialize rejection: {error:?}"
@@ -473,16 +489,19 @@ async fn v2_conductor_rejects_invalid_protocol_versions_with_responses() -> Resu
     assert_raw_initialize_rejected(
         serde_json::json!({}),
         "protocolVersion must be a valid ACP protocol version",
+        -32602,
     )
     .await?;
     assert_raw_initialize_rejected(
         serde_json::json!({ "protocolVersion": "2" }),
         "protocolVersion must be a valid ACP protocol version",
+        -32602,
     )
     .await?;
     assert_raw_initialize_rejected(
         serde_json::json!({ "protocolVersion": 0 }),
-        "unsupported ACP protocol version 0",
+        "Unsupported protocol version",
+        -32022,
     )
     .await
 }
@@ -687,6 +706,7 @@ async fn v2_session_new_preserves_request_and_response_through_proxy() -> Result
             assert_eq!(received_update, session_update);
             Ok(())
         })
+        .boxed_local()
         .await?;
 
     Ok(())
@@ -798,6 +818,7 @@ async fn v2_proxy_session_helper_preserves_response_and_routes_later_updates() -
             ));
             Ok(())
         })
+        .boxed_local()
         .await
 }
 

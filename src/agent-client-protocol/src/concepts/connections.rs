@@ -105,6 +105,48 @@
 //! [`ConnectionTo::incoming_closed`](crate::ConnectionTo::incoming_closed)
 //! itself.
 //!
+//! # Connection Termination
+//!
+//! Clean EOF is only one way a connection ends. Close callbacks do not run,
+//! and `incoming_closed` never completes, after a transport or handler error,
+//! foreground completion, or a dropped driver.
+//! [`ConnectionTo::terminated`](crate::ConnectionTo::terminated) completes for
+//! all of them with a [`ConnectionTermination`](crate::ConnectionTermination)
+//! reason, once the driver future has returned or been dropped:
+//!
+//! ```
+//! # use agent_client_protocol::{Client, ConnectTo, ConnectionTermination, Error};
+//! # async fn example(transport: impl ConnectTo<Client>) -> Result<(), Error> {
+//! let (connection_tx, connection_rx) = futures::channel::oneshot::channel();
+//! let driver = Client.builder().connect_with(transport, async |cx| {
+//!     drop(connection_tx.send(cx.clone()));
+//!     // ... drive the session ...
+//!     Ok(())
+//! });
+//! let observer = async {
+//!     let Ok(cx) = connection_rx.await else { return };
+//!     match cx.terminated().await {
+//!         ConnectionTermination::IncomingClosed => { /* peer hung up */ }
+//!         termination => {
+//!             let _error = termination.error();
+//!             // Run the same disconnect cleanup for every other reason.
+//!         }
+//!     }
+//! };
+//! let (result, ()) = futures::join!(driver, observer);
+//! result
+//! # }
+//! ```
+//!
+//! By then no handler, close callback, runner, or spawned task of the
+//! connection runs again, and every request still awaiting a response has
+//! failed. Requests failed by clean EOF keep the `incoming_transport_closed`
+//! error; the rest, and any sent afterwards, satisfy
+//! [`is_connection_terminated`](crate::is_connection_terminated). Dropping the
+//! driver performs only this synchronous bookkeeping: no asynchronous cleanup
+//! runs after an arbitrary drop. Termination is not ordered with application
+//! queues and does not reap child processes owned by the transport.
+//!
 //! # Sending Requests
 //!
 //! When you call `send_request()`, you get back a [`SentRequest`] that represents
@@ -131,14 +173,15 @@
 //!
 //! ## Option 2: Schedule a callback
 //!
-//! Use `on_receiving_result()` when you want to handle the response asynchronously:
+//! Use `prepare_request(...).on_receiving_result(...)` to register an ordered
+//! response callback before sending:
 //!
 //! ```
 //! # use agent_client_protocol::{Client, Agent, ConnectTo};
 //! # use agent_client_protocol_test::MyRequest;
 //! # async fn example(transport: impl ConnectTo<Client>) -> Result<(), agent_client_protocol::Error> {
 //! # Client.builder().connect_with(transport, async |cx| {
-//! cx.send_request(MyRequest {})
+//! cx.prepare_request(MyRequest {})
 //!     .on_receiving_result(async |result| {
 //!         match result {
 //!             Ok(response) => { /* handle success */ }
@@ -154,6 +197,11 @@
 //! ```
 //!
 //! See [Ordering](super::ordering) for important details about how these differ.
+//! Eager `send_request(...).on_receiving_result(...)` remains available, but can
+//! race with a fast response when called outside the connection future.
+//! `prepare_request(...).block_task()` and `.detach()` publish during their
+//! method calls without selecting ordered consumption. Dropping an unconsumed
+//! [`PreparedRequest`](crate::PreparedRequest) sends nothing.
 //!
 //! ## Dropping a `SentRequest`
 //!

@@ -2,21 +2,197 @@
 
 ## [Unreleased]
 
+## [3.6.0](https://github.com/agentclientprotocol/rust-sdk/compare/v3.5.0...v3.6.0) - 2026-10-28
+
 ### Added
 
-- Add opt-in `BoundedChannel`, charged serialized frames, `ChannelLimits`, and
-  bounded `ConnectTo` extraction with producer-side protocol, pending-request,
-  task, and dynamic-handler admission. Legacy `Channel` fields remain unchanged.
+- *(acp)* update agent-client-protocol-schema to 1.13.0 ([#443](https://github.com/agentclientprotocol/rust-sdk/pull/443))
 
-- *(unstable-v2)* Expose pending session injection through the
-  `unstable_session_inject` feature, including typed JSON-RPC dispatch and
-  `V2Session` helpers to inject, replace, and revoke typed content.
-- Add a default-enabled `schemars` feature that forwards JSON Schema support to
-  the schema crate and gates the typed MCP tool helpers. Set
-  `default-features = false` to use the core SDK without `schemars`; custom MCP
-  servers and independently enabled unstable protocol features remain available.
-  Existing users of `default-features = false` who need the previous JSON Schema
-  or typed MCP tool APIs should add `features = ["schemars"]`.
+### Fixed
+
+- stop logging MCP env and header values ([#445](https://github.com/agentclientprotocol/rust-sdk/pull/445))
+- *(acp)* follow v2 initialize negotiation rules and reject null request IDs ([#446](https://github.com/agentclientprotocol/rust-sdk/pull/446))
+- align examples, Testy and docs with ACP schema 1.13 ([#444](https://github.com/agentclientprotocol/rust-sdk/pull/444))
+
+## [3.5.0](https://github.com/agentclientprotocol/rust-sdk/compare/v3.4.0...v3.5.0) - 2026-10-22
+
+### Added
+
+- *(acp)* add send_initialize with typed lower-version outcome for v2 clients ([#435](https://github.com/agentclientprotocol/rust-sdk/pull/435))
+- *(acp)* add ConnectionTo::terminated for every connection end ([#434](https://github.com/agentclientprotocol/rust-sdk/pull/434))
+
+### Fixed
+
+- *(acp)* redact payload-bearing errors in warning logs ([#433](https://github.com/agentclientprotocol/rust-sdk/pull/433))
+
+### Fixed
+
+- Redact error messages and data in ordinary protocol warning logs, including
+  malformed notification parameters, handler failures, and outgoing error
+  responses. Preserve detailed returned errors and opt-in protocol tracing.
+  See [Logging and Diagnostic Privacy](../../md/logging-privacy.md).
+
+## [3.4.0](https://github.com/agentclientprotocol/rust-sdk/compare/v3.3.0...v3.4.0) - 2026-10-16
+
+### Added
+
+- *(acp)* update schema to 1.12.0 and align v2 lifecycle ([#423](https://github.com/agentclientprotocol/rust-sdk/pull/423))
+
+### Fixed
+
+- *(acp)* align protocol version negotiation ([#424](https://github.com/agentclientprotocol/rust-sdk/pull/424))
+
+## [3.3.0](https://github.com/agentclientprotocol/rust-sdk/compare/v3.2.0...v3.3.0) - 2026-10-09
+
+### Added
+
+- *(acp)* update schema to 1.11.0 ([#411](https://github.com/agentclientprotocol/rust-sdk/pull/411))
+
+## [3.2.0](https://github.com/agentclientprotocol/rust-sdk/compare/v3.1.0...v3.2.0) - 2026-10-08
+
+### Added
+
+- *(acp)* Add retained outgoing request cancellation handles ([#409](https://github.com/agentclientprotocol/rust-sdk/pull/409))
+
+### Added
+
+- Add `RequestCancellationHandle` and `cancellation_handle()` on prepared and
+  sent requests. Retain explicit cancellation control while an ordered callback
+  or future consumes the response, sharing SDK publication/settlement state and
+  once-only cancellation. Handle drop is inert; detaching a request suppresses
+  automatic cancellation without revoking retained explicit control.
+
+## [3.1.0](https://github.com/agentclientprotocol/rust-sdk/compare/v3.0.0...v3.1.0) - 2026-10-07
+
+### Added
+
+- *(acp)* add prepared requests with preselected response handling ([#407](https://github.com/agentclientprotocol/rust-sdk/pull/407))
+
+### Added
+
+- Add `prepare_request` and `prepare_request_to` on raw and v2 connections.
+  `PreparedRequest` selects response handling before sending: callbacks and
+  forwarding install ordering before publication, while `block_task` and
+  `detach` send without holding dispatch. Eager `send_request` APIs are unchanged.
+  See [Sending Requests](../../md/sending-requests.md).
+
+## [3.0.0](https://github.com/agentclientprotocol/rust-sdk/compare/v2.2.0...v3.0.0) - 2026-10-06
+
+### Added
+
+- *(acp)* forward unstable subagents schema support ([#402](https://github.com/agentclientprotocol/rust-sdk/pull/402))
+- *(config)* [**breaking**] make public configuration APIs extensible ([#403](https://github.com/agentclientprotocol/rust-sdk/pull/403))
+- *(acp)* [**breaking**] make native transports and schema support opt-in ([#397](https://github.com/agentclientprotocol/rust-sdk/pull/397))
+- *(acp)* [**breaking**] adopt request-scoped MCP binding ([#388](https://github.com/agentclientprotocol/rust-sdk/pull/388))
+- *(acp)* make schemars optional ([#373](https://github.com/agentclientprotocol/rust-sdk/pull/373))
+
+### Fixed
+
+- *(acp)* allow singleton role IDs without Default ([#400](https://github.com/agentclientprotocol/rust-sdk/pull/400))
+- *(acp)* cancel abandoned function-tool invocations ([#387](https://github.com/agentclientprotocol/rust-sdk/pull/387))
+- *(acp)* [**breaking**] preserve connection lifetimes and graceful drain ([#385](https://github.com/agentclientprotocol/rust-sdk/pull/385))
+- *(acp)* [**breaking**] preserve protocol-neutral raw JSON-RPC errors ([#384](https://github.com/agentclientprotocol/rust-sdk/pull/384))
+
+### Other
+
+- prepare v3 package metadata and release guidance ([#404](https://github.com/agentclientprotocol/rust-sdk/pull/404))
+- slim dependency features and CI validation ([#399](https://github.com/agentclientprotocol/rust-sdk/pull/399))
+- reconcile combined breaking release migrations ([#395](https://github.com/agentclientprotocol/rust-sdk/pull/395))
+- Simplify logs in example ([#386](https://github.com/agentclientprotocol/rust-sdk/pull/386))
+
+### Changed
+
+- Mark `AcpAgentConfig` non-exhaustive for future configuration extensions.
+  Existing private fields, constructors, fluent methods, getters, and JSON
+  behavior are unchanged; an executable is still required.
+  See the [config API migration guide](../../md/migration-config-api.md).
+- **Breaking (unstable MCP):** adopt schema 1.10.1's request-scoped
+  `mcp/message(serverId, requestId, method, params)` binding and independent
+  inner MCP result/error carriers. Remove MCP connect/disconnect and connection
+  IDs. Native MCP supports 2026-07-28 without an initialization prerequisite.
+  See the [native binding migration guide](../../md/migration-stateless-mcp.md).
+- **Breaking:** `RawJsonRpcMessage::Response` carries `RawJsonRpcResponse` with
+  a boxed `RawJsonRpcError`, preserving numeric codes, omitted/null data, and
+  error extension fields without ACP interpretation. Raw adapters must use the
+  new response type. Typed ACP consumers still receive `Error`; conversion to
+  ACP is explicit through `RawJsonRpcError::into_acp_error`.
+- **Breaking:** `ConnectTo::into_channel_and_future` now returns
+  `(Channel, Option<ConnectionDriver>)` instead of a boxed future. `Some` owns
+  connection work; a passive endpoint returns `None`. Custom overrides and
+  low-level callers must handle absence explicitly; wrappers should preserve
+  the original optional driver rather than erase its lifecycle metadata.
+  See the [connection-driver migration guide](../../md/migration-connection-drivers.md).
+- **Breaking:** enable no Cargo features by default. JSON Schema generation and
+  typed MCP tool helpers require `schemars`; native subprocess support requires
+  `process`, and the native `Stdio` adapter requires `stdio`. The two native
+  features are independent and expose `LineDirection` with either enabled.
+  Protocol serialization and generic transports remain available by default.
+  See [Cargo Features](../../md/features.md) for migration examples.
+- Request the futures executor only for tests and doctests, not production
+  connections. Internal test utilities no longer implicitly enable unrelated
+  unstable protocol features or JSON Schema generation.
+
+### Added
+
+- Expose the schema's `unstable_subagents` feature, independently and through
+  `unstable`. Subagent updates use the existing v1 and draft-v2 session
+  notification routes; applications remain responsible for subagent behavior.
+- Add reusable native MCP services with request-scoped metadata, notification
+  authority, and cancellation. Supervise owned operation cleanup through ACP
+  shutdown without changing generic frame queues or task limits.
+- Add an owned-only, awaitable `ConnectionDriver`. Passive endpoints have no
+  driver, so absence cannot be mistaken for a successful completed future.
+- Add `ConnectionDriver::with_finish(future, finish)` and `request_finish()` for
+  custom adapters to request graceful shutdown separately from awaiting
+  completion. Requests are idempotent; the one-shot hook signals the adapter
+  once, and its future must drain, flush, and close accepted output before
+  reporting success. Already-requested drivers retain that contract on handoff.
+- Add `ConnectionDriver::map_future` for tracing, error annotation, and
+  completion cleanup without losing finish capability or requested state.
+- Add an opt-in `schemars` feature that forwards JSON Schema support to the
+  schema crate and gates the typed MCP tool helpers. Custom MCP servers and
+  independently enabled unstable protocol features remain available without it.
+
+### Fixed
+
+- Allow custom roles without a `Default` implementation to construct their
+  singleton `RoleId`.
+- Keep recoverable session-local runner failures from cancelling unrelated native
+  MCP registrations or sealing connection-wide operation admission. Scoped sibling
+  runners remain driven through their own cleanup.
+- Destroy and acknowledge cancelled queued mutable-tool calls independently of an
+  active invocation, so cancelling a call or removing its provider does not wait
+  for another registration's unrelated work.
+- Cancel running function-backed MCP tool futures when their result receiver is
+  dropped, skip cancelled queued calls before invoking the tool closure, and keep
+  mutable and concurrent runners usable after a caller leaves or result delivery
+  fails. This drops the user future; it does not join operation-level async cleanup.
+- Preserve both directions of passive channel bridges after a write
+  half-close, allowing a final reverse-direction response.
+- Drain accepted output when an owned component finishes, including through
+  line and byte-stream adapters, without requiring unrelated remote input to
+  close. Ready component and I/O failures remain authoritative during drain.
+- Drain routable queued output on successful `Builder::connect_with`
+  foreground completion and finish cooperative physical transports without
+  starting queued application tasks solely for physical drain. Preserve the
+  inherited underway-close-callback cleanup phase. Fail unresolved
+  request-readiness gates rather than waiting indefinitely or publishing those
+  requests after shutdown.
+- Close and drain the incoming producer boundary when owned transport work
+  completes, including when escaped senders remain alive.
+- Forward physical write-half shutdown through byte-stream adapters so split
+  streams can receive a final reverse response after output EOF. Preserve
+  partial-write, flush, pending-shutdown, and close-error behavior.
+- Discard input to a completed foreground during physical finish, including
+  frames already queued at normalization, without losing genuine I/O errors
+  or cancelling accepted output.
+- Apply one ownership-aware drain rule to protocol connectors and agent/proxy
+  routers. Request cooperative finish after initialization rejection or owned
+  foreground completion; do not indefinitely join opposed opaque work.
+- Do not begin late application delivery or close callbacks after finite
+  foreground success. An underway close callback completes before output is
+  sealed, so clean EOF during physical drain cannot turn a late callback send
+  into a closed-queue failure that cancels accepted output.
 
 ## [2.2.0](https://github.com/agentclientprotocol/rust-sdk/compare/v2.1.0...v2.2.0) - 2026-09-18
 

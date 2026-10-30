@@ -8,7 +8,8 @@ use std::{
 
 use agent_client_protocol::{
     BoundedChannel, BoundedSender, ChannelLimits, ChargedFrame, Client, ConnectTo,
-    RawJsonRpcMessage, TransportBatchEntry, TransportFrame, schema::v1::RequestId,
+    ConnectionDriver, RawJsonRpcMessage, TransportBatchEntry, TransportFrame,
+    schema::v1::RequestId,
 };
 use axum::{
     Router,
@@ -18,7 +19,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
-use futures::{FutureExt, StreamExt, future::BoxFuture};
+use futures::{FutureExt, StreamExt};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 
 use super::ServerOptions;
@@ -126,12 +127,8 @@ impl ServerLimits {
     }
 }
 
-type Factory = dyn Fn(
-        ChannelLimits,
-    ) -> agent_client_protocol::Result<(
-        BoundedChannel,
-        BoxFuture<'static, agent_client_protocol::Result<()>>,
-    )> + Send
+type Factory = dyn Fn(ChannelLimits) -> agent_client_protocol::Result<(BoundedChannel, Option<ConnectionDriver>)>
+    + Send
     + Sync;
 
 /// HTTP/SSE-only bounded server. WebSocket upgrades are explicitly rejected.
@@ -736,7 +733,32 @@ async fn post_inner(
             // cancels its signal, which is not evidence of a core failure.
             let _terminal_owner = terminal_owner;
             let completion_connection = task_connection.clone();
+            let owned = agent.is_some();
+            let (finish_tx, finish_rx) = oneshot::channel();
+            let agent = async move {
+                if let Some(driver) = agent {
+                    driver.await.map_err(|_| ())?;
+                    // No producer is retained by this signal. Seal escaped
+                    // producers only after actual owned work succeeds.
+                    let _ = finish_tx.send(());
+                }
+                Ok::<(), ()>(())
+            };
             let router = async move {
+                let mut finish = Some(finish_rx);
+                let mut rx = futures::stream::poll_fn(move |cx| {
+                    if let Some(signal) = finish.as_mut() {
+                        match std::future::Future::poll(std::pin::Pin::new(signal), cx) {
+                            std::task::Poll::Ready(Ok(())) => {
+                                rx.close();
+                                finish = None;
+                            }
+                            std::task::Poll::Ready(Err(_)) => finish = None,
+                            std::task::Poll::Pending => {}
+                        }
+                    }
+                    futures::Stream::poll_next(std::pin::Pin::new(&mut rx), cx)
+                });
                 let mut init_tx = Some(init_tx);
                 while let Some(charged) = rx.next().await {
                     if charged.as_bytes().len() > task_connection.limits.max_frame_bytes {
@@ -764,34 +786,24 @@ async fn post_inner(
                 }
                 Ok::<(), ()>(())
             };
-            if graceful {
-                // EOF alone is insufficient: core failure also produces EOF. Poll
-                // failure first and again after both real futures have completed.
-                let done = async {
-                    futures::try_join!(router, async { agent.await.map_err(|_| ()) }).map(|_| ())
-                };
-                tokio::pin!(failure);
-                let result = tokio::select! {
-                    biased;
-                    _ = &mut failure => Err(()),
-                    result = done => result,
-                };
-                if result.is_ok()
-                    && failure.now_or_never().is_none()
-                    && completion_connection.finish_drain()
-                {
+            // EOF alone is insufficient: core failure also produces EOF, and
+            // owned work can still fail after closing its output direction.
+            let done = async { futures::try_join!(router, agent).map(|_| ()) };
+            tokio::pin!(failure);
+            let result = tokio::select! {
+                biased;
+                _ = &mut failure => Err(()),
+                result = done => result,
+            };
+            if result.is_ok() && failure.now_or_never().is_none() {
+                if owned {
+                    // Natural owned completion also seals POST admission. Keep
+                    // queued SSE output available to existing subscribers.
+                    completion_connection.begin_drain();
+                }
+                if (owned || graceful) && completion_connection.finish_drain() {
                     cleanup.armed = false;
                 }
-            } else {
-                // A bare channel's driver is immediately successful. Legacy mode
-                // keeps routing until EOF instead of dropping escaped producers.
-                let agent = async move {
-                    if agent.await.is_ok() {
-                        futures::future::pending::<()>().await;
-                    }
-                };
-                futures::pin_mut!(agent, router);
-                let _ = futures::future::select(router, agent).await;
             }
         });
         let abort = {

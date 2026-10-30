@@ -20,6 +20,12 @@ cargo build -p agent-client-protocol-test --bin testy --features unstable_protoc
 That binary selects v1 or v2 from the client's `initialize` request. `just prep-tests` already
 builds Testy with all features, so the prebuilt test binary supports both versions.
 
+Run the complete workspace suite with `just test`. Its `prep-tests` dependency builds
+all ordinary workspace binaries and examples in one Cargo invocation, including
+Testy, the conductor, `mcp-echo-server`, and `arrow_proxy`. The subsequent test run
+builds and runs the test harnesses and doctests. CI uses the same recipe rather
+than performing a separate all-target build first.
+
 To build stable-only coverage:
 
 ```bash
@@ -69,6 +75,13 @@ The `full` scenario sends every stable agent-to-client callback request:
 It also emits the stable session update variants, including message chunks, tool calls, plans,
 available commands, mode/config/session info, and usage.
 
+Every path a scenario sends is rooted in the session's `cwd`: the `testy-write.txt` file that
+`fs/write_text_file` writes and `fs/read_text_file` reads back, the working directory of each
+`terminal/create`, the tool-call locations and diff (`testy-input.txt`, `testy-output.txt`), and
+the `file:` URIs of the image, resource link, and embedded resource. A client that confines file
+and terminal access to the session's directories can run the scenarios in a project directory,
+and sessions rooted in different directories never share a file.
+
 `elicitations`, `callbacks`, and `full` cover `elicitation/create` form mode,
 URL mode, session scope, request scope, accept, decline, cancel, and `elicitation/complete`.
 If the client does not advertise form elicitation, the scenario returns a deterministic
@@ -84,7 +97,7 @@ With `unstable_protocol_v2`, the binary also handles the complete advertised v2 
 
 The v2 implementation follows the split prompt lifecycle:
 
-1. `session/prompt` returns an empty acceptance response.
+1. `session/prompt` returns an acceptance response carrying the accepted user message's `messageId`.
 2. Testy independently sends the accepted user message and a `running` state update.
 3. Output arrives through message updates.
 4. An `idle` state update with a stop reason completes the foreground work.
@@ -92,7 +105,15 @@ The v2 implementation follows the split prompt lifecycle:
 `wait_for_cancel` makes this separation deterministic for client tests: prompt acceptance returns
 while work remains active, and `session/cancel` is confirmed by `idle` with the `cancelled` stop
 reason. Testy also keeps simple message history and replays it before a `session/resume` response
-when the client requests replay from the start.
+when the client requests replay from the start. Every successful resume sends
+the current session info (`session_info_update` with the title) and a current
+idle-state snapshot after any replay and before responding, including when
+replay was not requested. Neither is a replayed historical change, and the
+snapshot is not another completed turn.
+
+Prompts may contain only the baseline `text` and `resource_link` content blocks; any other block
+is rejected with `-32602` before the turn begins. `session/list` returns every session in one page
+and never issues `nextCursor`, so any `cursor` is rejected with `-32602`.
 
 The existing v1 scenarios do not map one-to-one onto v2. V2 scenario parity, client callbacks,
 MCP, authentication, deletion, configuration, and other optional capabilities remain unadvertised

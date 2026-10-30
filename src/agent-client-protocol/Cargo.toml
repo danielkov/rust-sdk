@@ -1,17 +1,14 @@
 [package]
 name = "agentkit-acp-sdk"
-version = "2.2.0"
+version = "3.6.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-repository = "https://github.com/danielkov/rust-sdk"
-description = "Agent Client Protocol SDK fork used by agentkit, adding unstable v2 session injection, tracked response receipts and bounded transports"
+repository.workspace = true
+description = "Core protocol types and traits for the Agent Client Protocol"
 keywords = ["acp", "agent", "protocol", "ai"]
 categories = ["development-tools"]
-
-[lib]
-name = "agent_client_protocol"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -19,24 +16,39 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [[example]]
 name = "simple_agent_v2"
-required-features = ["unstable_protocol_v2"]
+required-features = ["stdio", "unstable_protocol_v2"]
 test = true
 
 [[example]]
 name = "v2_one_shot_client"
-required-features = ["unstable_protocol_v2"]
+required-features = ["process", "unstable_protocol_v2"]
 test = true
 
 [[example]]
 name = "v2_session_coordination"
-required-features = ["unstable_protocol_v2"]
+required-features = ["process", "unstable_protocol_v2"]
 test = true
 
+[[example]]
+name = "simple_agent"
+required-features = ["stdio"]
+
+[[example]]
+name = "yolo_one_shot_client"
+required-features = ["process"]
+
+[lib]
+name = "agent_client_protocol"
+
 [features]
-default = ["schemars"]
+default = []
 
 # JSON Schema generation for protocol types and typed MCP tool helpers.
 schemars = ["dep:schemars", "agent-client-protocol-schema/schemars"]
+
+# Native transports. Their dependencies and exports remain excluded on WebAssembly.
+process = ["dep:async-io", "dep:async-process", "dep:shell-words", "dep:rustix", "dep:windows-sys"]
+stdio = ["dep:blocking"]
 
 # Forward unstable features from agent-client-protocol-schema.
 # Enable these to get support for the corresponding unstable ACP surfaces.
@@ -45,21 +57,18 @@ unstable = [
     "unstable_llm_providers",
     "unstable_mcp_over_acp",
     "unstable_plan_operations",
-    "unstable_session_compaction",
     "unstable_session_fork",
-    "unstable_session_notices",
+    "unstable_session_system_prompt",
+    "unstable_subagents",
 ]
 unstable_end_turn_token_usage = ["agent-client-protocol-schema/unstable_end_turn_token_usage"]
 unstable_llm_providers = ["agent-client-protocol-schema/unstable_llm_providers"]
 unstable_mcp_over_acp = ["agent-client-protocol-schema/unstable_mcp_over_acp"]
 unstable_plan_operations = ["agent-client-protocol-schema/unstable_plan_operations"]
-unstable_session_compaction = ["agent-client-protocol-schema/unstable_session_compaction"]
 unstable_session_fork = ["agent-client-protocol-schema/unstable_session_fork"]
-unstable_session_notices = ["agent-client-protocol-schema/unstable_session_notices"]
-unstable_session_inject = [
-    "unstable_protocol_v2",
-    "agent-client-protocol-schema/unstable_session_inject",
-]
+unstable_session_system_prompt = ["agent-client-protocol-schema/unstable_session_system_prompt"]
+unstable_subagents = ["agent-client-protocol-schema/unstable_subagents"]
+unstable_session_inject = ["unstable_protocol_v2", "agent-client-protocol-schema/unstable_session_inject"]
 unstable_protocol_v2 = ["agent-client-protocol-schema/unstable_protocol_v2"]
 
 # Use Web Crypto through wasm-bindgen for UUID randomness on JavaScript-hosted,
@@ -79,23 +88,32 @@ tracing.workspace = true
 uuid.workspace = true
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-async-io.workspace = true
-async-process.workspace = true
-blocking.workspace = true
-shell-words.workspace = true
+async-io = { workspace = true, optional = true }
+async-process = { workspace = true, optional = true }
+blocking = { workspace = true, optional = true }
+shell-words = { workspace = true, optional = true }
 
 [target.'cfg(all(unix, not(target_family = "wasm")))'.dependencies]
-rustix.workspace = true
+rustix = { workspace = true, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_System_Threading"] }
+windows-sys = { workspace = true, features = ["Win32_System_Threading"], optional = true }
+
+# Resolution-only security constraints; this target never adds compiled dependencies.
+# libc 0.2.190/0.2.191 regress gnux32 siginfo_t layout; newer wasm-bindgen
+# exposes unsynchronized JSPI state through safe APIs. Re-audit before relaxing.
+[target.'cfg(any())'.dependencies]
+libc = { version = "=0.2.189", default-features = false }
+wasm-bindgen = { version = "=0.2.128", default-features = false }
 
 [dev-dependencies]
 agent-client-protocol-test.workspace = true
 clap.workspace = true
 expect-test.workspace = true
+futures = { workspace = true, features = ["executor"] }
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "rt", "rt-multi-thread", "sync", "time"] }
 tokio-util.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
