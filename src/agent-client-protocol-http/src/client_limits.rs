@@ -140,7 +140,6 @@ impl BoundedHttpClient {
     /// Extract the charged channel without a legacy adapter. Poll the returned
     /// future to drive HTTP; dropping it cancels streams and POSTs. Connection
     /// cleanup is best effort, as described on [`BoundedHttpClient`].
-    #[must_use]
     pub fn into_bounded_channel_and_future(self) -> (BoundedChannel, ConnectionDriver) {
         let (finish_tx, finish_rx) = oneshot::channel();
         let driver = ConnectionDriver::with_finish(
@@ -687,9 +686,11 @@ mod tests {
         use axum::{Router, body::Body, response::Response, routing::post};
         // A single ready body must not monopolize the driver poll. Keep the
         // stream open afterwards so EOF cannot mask admission failures.
-        let events = (0..1000)
-            .map(|index| format!("data: {{\"jsonrpc\":\"2.0\",\"method\":\"update\",\"params\":{{\"index\":{index}}}}}\n\n"))
-            .collect::<String>();
+        use std::fmt::Write as _;
+        let mut events = String::new();
+        for index in 0..1000 {
+            write!(events, "data: {{\"jsonrpc\":\"2.0\",\"method\":\"update\",\"params\":{{\"index\":{index}}}}}\n\n").unwrap();
+        }
         let app = Router::new().route(
             "/acp",
             post(|| async {
@@ -806,9 +807,11 @@ mod tests {
                         panic!("burst driver exited: {result:?}")
                     }
                     futures::future::Either::Right((frame, _)) => {
-                        if frame.is_none() {
-                            panic!("burst channel closed: {:?}", (&mut transport).await);
-                        }
+                        assert!(
+                            frame.is_some(),
+                            "burst channel closed: {:?}",
+                            (&mut transport).await
+                        );
                     }
                 }
             }

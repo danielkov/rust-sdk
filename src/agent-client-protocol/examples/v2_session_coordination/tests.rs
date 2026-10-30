@@ -162,7 +162,7 @@ async fn concurrent_loaders_share_one_resume_and_projection() {
     let (started, start) = oneshot::channel();
     let (abandoned, abandon) = oneshot::channel();
     let (done, finished) = oneshot::channel();
-    exercise(
+    Box::pin(exercise(
         async move |sessions| {
             let first = sessions.load(SESSION.into())?;
             let second = sessions.load(SESSION.into())?;
@@ -197,7 +197,7 @@ async fn concurrent_loaders_share_one_resume_and_projection() {
             // A second resume or an early/duplicate close fails this script.
             peer.finish(&[SESSION], done).await;
         },
-    )
+    ))
     .await;
 }
 
