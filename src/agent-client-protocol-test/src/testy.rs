@@ -44,7 +44,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -297,7 +297,7 @@ impl Testy {
             .sessions
             .get(session_id)
             .cloned()
-            .ok_or_else(|| invalid_params(format!("unknown session `{session_id}`")))
+            .ok_or_else(|| session_not_found(session_id))
     }
 
     fn begin_prompt(&self, session_id: &SessionId) -> Result<(), agent_client_protocol::Error> {
@@ -305,10 +305,8 @@ impl Testy {
         let session = state
             .sessions
             .get_mut(session_id)
-            .ok_or_else(|| invalid_params(format!("unknown session `{session_id}`")))?;
-        if session.closed {
-            return Err(invalid_params(format!("closed session `{session_id}`")));
-        }
+            .filter(|session| !session.closed)
+            .ok_or_else(|| session_not_found(session_id))?;
         session.active_prompts += 1;
         Ok(())
     }
@@ -476,6 +474,13 @@ impl Testy {
         request: ListSessionsRequest,
         responder: Responder<ListSessionsResponse>,
     ) -> Result<(), agent_client_protocol::Error> {
+        // Testy returns every session in one page and never issues a
+        // `nextCursor`, so any cursor a client sends is invalid.
+        if let Some(cursor) = &request.cursor {
+            return responder.respond_with_error(invalid_params(format!(
+                "invalid session/list cursor `{cursor}`"
+            )));
+        }
         let mut sessions = self
             .lock_state()
             .sessions
@@ -524,8 +529,12 @@ impl Testy {
     ) -> Result<(), agent_client_protocol::Error> {
         let (remove_session, did_cancel) = {
             let mut state = self.lock_state();
-            let Some(session) = state.sessions.get_mut(&request.session_id) else {
-                return responder.respond(CloseSessionResponse::new());
+            let Some(session) = state
+                .sessions
+                .get_mut(&request.session_id)
+                .filter(|session| !session.closed)
+            else {
+                return responder.respond_with_error(session_not_found(&request.session_id));
             };
             session.cancelled = true;
             session.closed = true;
@@ -553,18 +562,13 @@ impl Testy {
         }
 
         let mut state = self.lock_state();
-        let Some(session) = state.sessions.get_mut(&request.session_id) else {
-            return responder.respond_with_error(invalid_params(format!(
-                "unknown session `{}`",
-                request.session_id
-            )));
+        let Some(session) = state
+            .sessions
+            .get_mut(&request.session_id)
+            .filter(|session| !session.closed)
+        else {
+            return responder.respond_with_error(session_not_found(&request.session_id));
         };
-        if session.closed {
-            return responder.respond_with_error(invalid_params(format!(
-                "closed session `{}`",
-                request.session_id
-            )));
-        }
         session.current_mode_id = request.mode_id;
         responder.respond(SetSessionModeResponse::new())
     }
@@ -593,18 +597,13 @@ impl Testy {
 
         let config_options = {
             let mut state = self.lock_state();
-            let Some(session) = state.sessions.get_mut(&request.session_id) else {
-                return responder.respond_with_error(invalid_params(format!(
-                    "unknown session `{}`",
-                    request.session_id
-                )));
+            let Some(session) = state
+                .sessions
+                .get_mut(&request.session_id)
+                .filter(|session| !session.closed)
+            else {
+                return responder.respond_with_error(session_not_found(&request.session_id));
             };
-            if session.closed {
-                return responder.respond_with_error(invalid_params(format!(
-                    "closed session `{}`",
-                    request.session_id
-                )));
-            }
             session.current_config_value = selected_value;
             session.config_options()
         };
@@ -640,8 +639,7 @@ impl Testy {
                     tool,
                     params,
                 } => Ok(
-                    match self
-                        .execute_tool_call(&session_id, &server, &tool, params)
+                    match Box::pin(self.execute_tool_call(&session_id, &server, &tool, params))
                         .await
                     {
                         Ok(result) => (format!("OK: {result}"), StopReason::EndTurn),
@@ -854,6 +852,7 @@ impl Testy {
         prompt: &[ContentBlock],
         connection: &ConnectionTo<Client>,
     ) -> Result<(), agent_client_protocol::Error> {
+        let cwd = self.get_session(session_id)?.cwd;
         let prompt_summary = format!("received {} prompt content block(s)", prompt.len());
         send_session_update(
             connection,
@@ -888,7 +887,7 @@ impl Testy {
                         "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
                         "image/png",
                     )
-                    .uri("file:///tmp/testy-pixel.png"),
+                    .uri(file_uri(&cwd.join("testy-pixel.png"))),
                 ))
                 .message_id(self.next_message_id("testy-content-image")),
             ),
@@ -909,9 +908,12 @@ impl Testy {
             session_id,
             SessionUpdate::AgentMessageChunk(
                 ContentChunk::new(ContentBlock::ResourceLink(
-                    ResourceLink::new("Testy reference", "file:///tmp/testy-reference.txt")
-                        .description("A deterministic resource link emitted by Testy")
-                        .mime_type("text/plain"),
+                    ResourceLink::new(
+                        "Testy reference",
+                        file_uri(&cwd.join("testy-reference.txt")),
+                    )
+                    .description("A deterministic resource link emitted by Testy")
+                    .mime_type("text/plain"),
                 ))
                 .message_id(self.next_message_id("testy-resource-message")),
             ),
@@ -924,7 +926,7 @@ impl Testy {
                     EmbeddedResourceResource::TextResourceContents(
                         TextResourceContents::new(
                             "embedded resource text from testy",
-                            "file:///tmp/testy-embedded.txt",
+                            file_uri(&cwd.join("testy-embedded.txt")),
                         )
                         .mime_type("text/plain"),
                     ),
@@ -940,20 +942,26 @@ impl Testy {
         connection: &ConnectionTo<Client>,
         terminal_id: Option<&str>,
     ) -> Result<(), agent_client_protocol::Error> {
+        let cwd = self.get_session(session_id)?.cwd;
+        let input_path = cwd.join("testy-input.txt");
+        let output_path = cwd.join("testy-output.txt");
         let read_tool_call_id = self.next_tool_call_id("testy-tool-read");
         let edit_tool_call_id = self.next_tool_call_id("testy-tool-edit");
         let initial = ToolCall::new(read_tool_call_id.clone(), "Read deterministic fixture")
             .kind(ToolKind::Read)
             .status(ToolCallStatus::Pending)
-            .locations(vec![ToolCallLocation::new("/tmp/testy-input.txt").line(1)])
-            .raw_input(serde_json::json!({ "path": "/tmp/testy-input.txt" }));
+            .locations(vec![ToolCallLocation::new(input_path.clone()).line(1)])
+            .raw_input(serde_json::json!({ "path": input_path.display().to_string() }));
         send_session_update(connection, session_id, SessionUpdate::ToolCall(initial))?;
 
         let in_progress = ToolCallUpdate::new(
             read_tool_call_id.clone(),
             ToolCallUpdateFields::new()
                 .status(ToolCallStatus::InProgress)
-                .content(vec![ToolCallContent::from("reading /tmp/testy-input.txt")]),
+                .content(vec![ToolCallContent::from(format!(
+                    "reading {}",
+                    input_path.display()
+                ))]),
         );
         send_session_update(
             connection,
@@ -965,7 +973,10 @@ impl Testy {
             read_tool_call_id,
             ToolCallUpdateFields::new()
                 .status(ToolCallStatus::Completed)
-                .content(vec![ToolCallContent::from("read /tmp/testy-input.txt")])
+                .content(vec![ToolCallContent::from(format!(
+                    "read {}",
+                    input_path.display()
+                ))])
                 .raw_output(serde_json::json!({ "bytes": 12 })),
         );
         send_session_update(
@@ -977,7 +988,7 @@ impl Testy {
         let edit_initial = ToolCall::new(edit_tool_call_id.clone(), "Apply deterministic edit")
             .kind(ToolKind::Edit)
             .status(ToolCallStatus::Pending)
-            .raw_input(serde_json::json!({ "path": "/tmp/testy-output.txt" }));
+            .raw_input(serde_json::json!({ "path": output_path.display().to_string() }));
         send_session_update(
             connection,
             session_id,
@@ -991,7 +1002,7 @@ impl Testy {
                 .kind(ToolKind::Edit)
                 .status(ToolCallStatus::Completed)
                 .content(vec![ToolCallContent::Diff(
-                    Diff::new("/tmp/testy-output.txt", "after\n").old_text("before\n"),
+                    Diff::new(output_path, "after\n").old_text("before\n"),
                 )])
                 .raw_output(serde_json::json!({ "changed": true })),
         );
@@ -1060,7 +1071,7 @@ impl Testy {
     ) -> Result<Option<TerminalId>, agent_client_protocol::Error> {
         let request = CreateTerminalRequest::new(session_id.clone(), "printf")
             .args(vec!["testy terminal content\n".to_string()])
-            .cwd(PathBuf::from("/tmp"))
+            .cwd(self.get_session(session_id)?.cwd)
             .output_byte_limit(1024);
         match self
             .request_result_until_cancelled(session_id, connection, request)
@@ -1337,7 +1348,8 @@ impl Testy {
             return Ok(());
         }
 
-        let write_path = PathBuf::from("/tmp/testy-write.txt");
+        let cwd = self.get_session(session_id)?.cwd;
+        let write_path = cwd.join("testy-write.txt");
         report.push(
             self.request_report_until_cancelled(
                 session_id,
@@ -1375,7 +1387,7 @@ impl Testy {
                 connection,
                 CreateTerminalRequest::new(session_id.clone(), "printf")
                     .args(vec!["testy terminal\n".to_string()])
-                    .cwd(PathBuf::from("/tmp"))
+                    .cwd(cwd)
                     .output_byte_limit(1024),
             )
             .await;
@@ -1464,14 +1476,25 @@ impl Testy {
         operation: F,
     ) -> Result<T>
     where
-        F: FnOnce(rmcp::service::RunningService<rmcp::RoleClient, ()>) -> Fut,
+        F: FnOnce(
+            rmcp::service::RunningService<rmcp::RoleClient, rmcp::model::ClientConfig>,
+        ) -> Fut,
         Fut: std::future::Future<Output = Result<T>>,
     {
         use rmcp::{
-            ServiceExt,
+            ClientLifecycleMode, ClientServiceExt, ServiceExt,
+            model::{ClientCapabilities, ClientConfig, Implementation, ProtocolVersion},
             transport::{ConfigureCommandExt, TokioChildProcess},
         };
         use tokio::process::Command;
+
+        let client_config = || {
+            ClientConfig::new(
+                ClientCapabilities::default(),
+                Implementation::new("testy", env!("CARGO_PKG_VERSION")),
+            )
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
+        };
 
         let mcp_servers = self
             .get_mcp_servers(session_id)
@@ -1490,7 +1513,8 @@ impl Testy {
         match mcp_server {
             McpServer::Stdio(stdio) => {
                 self.run_until_session_cancelled(session_id, async move {
-                    let mcp_client = ()
+                    // Standalone stdio retains the ordinary initialize handshake.
+                    let mcp_client = ClientConfig::default()
                         .serve(TokioChildProcess::new(
                             Command::new(&stdio.command).configure(|cmd| {
                                 cmd.args(&stdio.args);
@@ -1516,9 +1540,13 @@ impl Testy {
                         .custom_headers(http_headers(&http.headers)?);
 
                 self.run_until_session_cancelled(session_id, async move {
-                    let mcp_client =
-                        ().serve(StreamableHttpClientTransport::from_config(transport_config))
-                            .await?;
+                    let mcp_client = Box::pin(client_config().serve_with_lifecycle(
+                        StreamableHttpClientTransport::from_config(transport_config),
+                        ClientLifecycleMode::Discover {
+                            preferred_versions: vec![ProtocolVersion::V_2026_07_28],
+                        },
+                    ))
+                    .await?;
 
                     operation(mcp_client).await
                 })
@@ -1779,8 +1807,23 @@ fn send_session_update(
     connection.send_notification(SessionNotification::new(session_id.clone(), update))
 }
 
+/// The `file:` URI of a scenario path under the session `cwd`, percent-encoded
+/// and with its drive letter on Windows.
+///
+/// ACP requires an absolute `cwd`. A client that sends a relative one still
+/// gets a URI, not a failed scenario.
+fn file_uri(path: &Path) -> String {
+    url::Url::from_file_path(path)
+        .map_or_else(|()| format!("file://{}", path.display()), String::from)
+}
+
 fn invalid_params(message: impl ToString) -> agent_client_protocol::Error {
     agent_client_protocol::Error::invalid_params().data(message.to_string())
+}
+
+/// `-32002` for a session that does not exist or is not active on this connection.
+fn session_not_found(session_id: &SessionId) -> agent_client_protocol::Error {
+    agent_client_protocol::Error::session_not_found(session_id.clone())
 }
 
 fn is_supported_mode_id(mode_id: &SessionModeId) -> bool {
@@ -1975,7 +2018,9 @@ impl ConnectTo<Client> for Testy {
                         let cx_clone = cx.clone();
                         let spawn_result = cx.spawn({
                             let agent = agent.clone();
-                            async move { agent.process_prompt(request, responder, cx_clone).await }
+                            async move {
+                                Box::pin(agent.process_prompt(request, responder, cx_clone)).await
+                            }
                         });
                         if spawn_result.is_err() {
                             agent.finish_prompt(&session_id, StopReason::EndTurn);

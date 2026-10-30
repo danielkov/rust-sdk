@@ -1,8 +1,8 @@
 use std::{convert::Infallible, error::Error as _, sync::Arc, time::Duration};
 
 use agent_client_protocol::{
-    RawJsonRpcMessage, TransportBatchEntry, TransportFrame, schema::v1::RequestId,
-    schema::v1::Response as RpcResponse,
+    RawJsonRpcMessage, RawJsonRpcResponse as RpcResponse, TransportBatchEntry, TransportFrame,
+    schema::v1::RequestId,
 };
 use axum::{
     body::Body,
@@ -10,7 +10,7 @@ use axum::{
     http::{HeaderMap, HeaderValue, Request, StatusCode, header},
     response::{IntoResponse, Response, Sse, sse::Event},
 };
-use tracing::{error, info, trace};
+use tracing::{error, info};
 
 use crate::{
     connection::{Connection, ConnectionRegistry, ResponseRoute},
@@ -49,7 +49,7 @@ pub(crate) async fn handle_post(
     let body = match axum::body::to_bytes(request.into_body(), MAX_POST_BODY_BYTES).await {
         Ok(body) => body,
         Err(e) => {
-            error!("Failed to read request body: {e}");
+            error!("Failed to read request body");
             if is_body_limit_error(&e) {
                 return post_body_too_large_response();
             }
@@ -68,6 +68,7 @@ pub(crate) async fn handle_post(
         }
     };
     let mut frame = TransportFrame::parse_json(body);
+    crate::diagnostics::inbound(&frame, body.len(), "HTTP POST");
 
     if let Some((initialize_id, initialize_index)) =
         initial_initialize_request(&frame).map(|(id, index)| (id.clone(), index))
@@ -114,13 +115,10 @@ pub(crate) async fn handle_post(
                 return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
             }
         };
-        let init_response = match init_response_frame.to_json() {
-            Ok(response) => response,
-            Err(e) => {
-                initialize_cleanup.cleanup().await;
-                error!("failed to serialize initialize response: {e}");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
+        let Ok(init_response) = init_response_frame.to_json() else {
+            initialize_cleanup.cleanup().await;
+            error!("failed to serialize initialize response");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         };
         if initialize_failed {
             initialize_cleanup.cleanup().await;
@@ -150,7 +148,6 @@ pub(crate) async fn handle_post(
                 Err(error) => return (StatusCode::BAD_REQUEST, error).into_response(),
             };
             collect_route(message, route, &mut session_routes, &mut pending_routes);
-            trace!(connection_id = %connection_id, ?message, "POST → agent");
         }
         TransportFrame::Batch(batch) => {
             for entry in batch.entries_mut() {
@@ -163,11 +160,8 @@ pub(crate) async fn handle_post(
                 };
                 collect_route(message, route, &mut session_routes, &mut pending_routes);
             }
-            trace!(connection_id = %connection_id, ?frame, "POST batch → agent");
         }
-        TransportFrame::Malformed { .. } => {
-            trace!(connection_id = %connection_id, ?frame, "POST malformed frame → agent");
-        }
+        TransportFrame::Malformed { .. } => {}
     }
 
     for session_id in session_routes {
@@ -369,12 +363,12 @@ pub(crate) async fn handle_get(
     let stream = async_stream::stream! {
         loop {
             while let Ok(msg) = receiver.try_recv() {
-                trace!(payload = %msg, "SSE → client");
+                crate::diagnostics::outbound(msg.len(), "SSE");
                 yield Ok::<_, Infallible>(Event::default().data(msg));
             }
             if *closed.borrow() {
                 while let Ok(msg) = receiver.try_recv() {
-                    trace!(payload = %msg, "SSE → client");
+                    crate::diagnostics::outbound(msg.len(), "SSE");
                     yield Ok(Event::default().data(msg));
                 }
                 break;
@@ -383,7 +377,7 @@ pub(crate) async fn handle_get(
                 biased;
                 recv = receiver.recv() => match recv {
                     Some(msg) => {
-                        trace!(payload = %msg, "SSE → client");
+                        crate::diagnostics::outbound(msg.len(), "SSE");
                         yield Ok(Event::default().data(msg));
                     }
                     None => break,
@@ -391,7 +385,7 @@ pub(crate) async fn handle_get(
                 changed = closed.changed() => {
                     if changed.is_err() || *closed.borrow() {
                         while let Ok(msg) = receiver.try_recv() {
-                            trace!(payload = %msg, "SSE → client");
+                            crate::diagnostics::outbound(msg.len(), "SSE");
                             yield Ok(Event::default().data(msg));
                         }
                         break;
@@ -485,10 +479,10 @@ mod tests {
     use std::sync::Arc;
 
     use agent_client_protocol::{
-        Channel, RawJsonRpcMessage, TransportBatch, TransportBatchEntry, TransportFrame,
-        schema::v1::RequestId,
+        Channel, ConnectionDriver, RawJsonRpcMessage, TransportBatch, TransportBatchEntry,
+        TransportFrame, schema::v1::RequestId,
     };
-    use futures::{StreamExt, future::BoxFuture};
+    use futures::StreamExt;
     use serde_json::json;
     use tokio::{
         sync::mpsc,
@@ -505,15 +499,10 @@ mod tests {
     }
 
     impl AgentFactory for CapturingAgentFactory {
-        fn spawn_agent(
-            &self,
-        ) -> (
-            Channel,
-            BoxFuture<'static, agent_client_protocol::Result<()>>,
-        ) {
+        fn spawn_agent(&self) -> (Channel, Option<ConnectionDriver>) {
             let (agent, transport) = Channel::duplex();
             let forwarded = self.forwarded.clone();
-            let future = Box::pin(async move {
+            let future = ConnectionDriver::new(async move {
                 let Channel {
                     rx: mut incoming,
                     tx: _,
@@ -529,21 +518,16 @@ mod tests {
                 Ok(())
             });
 
-            (transport, future)
+            (transport, Some(future))
         }
     }
 
     struct RejectingInitializeAgentFactory;
 
     impl AgentFactory for RejectingInitializeAgentFactory {
-        fn spawn_agent(
-            &self,
-        ) -> (
-            Channel,
-            BoxFuture<'static, agent_client_protocol::Result<()>>,
-        ) {
+        fn spawn_agent(&self) -> (Channel, Option<ConnectionDriver>) {
             let (mut agent, transport) = Channel::duplex();
-            let future = Box::pin(async move {
+            let future = ConnectionDriver::new(async move {
                 match agent.rx.next().await {
                     Some(TransportFrame::Single(RawJsonRpcMessage::Request(request))) => {
                         agent
@@ -583,21 +567,16 @@ mod tests {
                 std::future::pending::<agent_client_protocol::Result<()>>().await
             });
 
-            (transport, future)
+            (transport, Some(future))
         }
     }
 
     struct PendingInitializeAgentFactory;
 
     impl AgentFactory for PendingInitializeAgentFactory {
-        fn spawn_agent(
-            &self,
-        ) -> (
-            Channel,
-            BoxFuture<'static, agent_client_protocol::Result<()>>,
-        ) {
+        fn spawn_agent(&self) -> (Channel, Option<ConnectionDriver>) {
             let (agent, transport) = Channel::duplex();
-            let future = Box::pin(async move {
+            let future = ConnectionDriver::new(async move {
                 let Channel {
                     rx: mut incoming,
                     tx: _outgoing,
@@ -606,7 +585,7 @@ mod tests {
                 std::future::pending::<agent_client_protocol::Result<()>>().await
             });
 
-            (transport, future)
+            (transport, Some(future))
         }
     }
 
@@ -615,15 +594,10 @@ mod tests {
     }
 
     impl AgentFactory for BatchAgentFactory {
-        fn spawn_agent(
-            &self,
-        ) -> (
-            Channel,
-            BoxFuture<'static, agent_client_protocol::Result<()>>,
-        ) {
+        fn spawn_agent(&self) -> (Channel, Option<ConnectionDriver>) {
             let (mut agent, transport) = Channel::duplex();
             let forwarded = self.forwarded.clone();
-            let future = Box::pin(async move {
+            let future = ConnectionDriver::new(async move {
                 let Some(TransportFrame::Batch(batch)) = agent.rx.next().await else {
                     panic!("expected one batch frame");
                 };
@@ -676,21 +650,16 @@ mod tests {
                 std::future::pending::<agent_client_protocol::Result<()>>().await
             });
 
-            (transport, future)
+            (transport, Some(future))
         }
     }
 
     struct SideTrafficBeforeInitializeResponseAgentFactory;
 
     impl AgentFactory for SideTrafficBeforeInitializeResponseAgentFactory {
-        fn spawn_agent(
-            &self,
-        ) -> (
-            Channel,
-            BoxFuture<'static, agent_client_protocol::Result<()>>,
-        ) {
+        fn spawn_agent(&self) -> (Channel, Option<ConnectionDriver>) {
             let (mut agent, transport) = Channel::duplex();
-            let future = Box::pin(async move {
+            let future = ConnectionDriver::new(async move {
                 let Some(TransportFrame::Batch(batch)) = agent.rx.next().await else {
                     panic!("expected one initial batch frame");
                 };
@@ -725,7 +694,7 @@ mod tests {
                 std::future::pending::<agent_client_protocol::Result<()>>().await
             });
 
-            (transport, future)
+            (transport, Some(future))
         }
     }
 

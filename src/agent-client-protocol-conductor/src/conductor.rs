@@ -162,8 +162,10 @@ impl InitializeProtocol {
         } else if requested == ProtocolVersion::V1 {
             Self::V1
         } else {
-            return Err(Error::invalid_request()
-                .data(format!("unsupported ACP protocol version {requested}")));
+            return Err(agent_client_protocol::util::unsupported_protocol_version(
+                requested,
+                &[ProtocolVersion::V1, ProtocolVersion::V2],
+            ));
         };
 
         Ok(InitializeProtocolSelection {
@@ -508,7 +510,16 @@ where
         client: ConnectionTo<Host::Counterpart>,
         message: ConductorMessage,
     ) -> Result<(), agent_client_protocol::Error> {
-        tracing::debug!(?message, "handle_conductor_message");
+        let (direction, dispatch) = match &message {
+            ConductorMessage::LeftToRight { message, .. } => ("left_to_right", message),
+            ConductorMessage::RightToLeft { message, .. } => ("right_to_left", message),
+        };
+        tracing::debug!(
+            direction,
+            method = dispatch.method(),
+            id = ?dispatch.id(),
+            "handle_conductor_message"
+        );
 
         match message {
             ConductorMessage::LeftToRight {
@@ -650,7 +661,8 @@ where
     ) -> Result<(), agent_client_protocol::Error> {
         tracing::trace!(
             target_component_index,
-            ?message,
+            method = message.method(),
+            id = ?message.id(),
             "forward_client_to_agent_message"
         );
 
@@ -914,7 +926,11 @@ where
         target_component_index: usize,
         message: Dispatch,
     ) -> Result<(), agent_client_protocol::Error> {
-        tracing::debug!(?message, "forward_message_to_proxy");
+        tracing::debug!(
+            method = message.method(),
+            id = ?message.id(),
+            "forward_message_to_proxy"
+        );
 
         #[cfg(not(feature = "unstable_protocol_v2"))]
         {
@@ -942,7 +958,10 @@ where
                     // request.
                     let sent = sent.forward_cancellation_from(responder.cancellation());
                     sent.on_receiving_result(async move |result| {
-                        tracing::debug!(?result, "got initialize_proxy response from proxy");
+                        tracing::debug!(
+                            ok = result.is_ok(),
+                            "got initialize_proxy response from proxy"
+                        );
                         responder.respond_with_result(result)
                     })
                 })
@@ -973,7 +992,10 @@ where
                     let sent = self.proxies[target_component_index].send_request(request);
                     let sent = sent.forward_cancellation_from(responder.cancellation());
                     sent.on_receiving_result(async move |result| {
-                        tracing::debug!(?result, "got initialize_proxy response from proxy");
+                        tracing::debug!(
+                            ok = result.is_ok(),
+                            "got initialize_proxy response from proxy"
+                        );
                         responder.respond_with_result(result)
                     })
                 }
@@ -1100,7 +1122,6 @@ pub trait InstantiateProxies: Send {
     /// Static component collections supplied by this crate support both
     /// versions and pass the request through unchanged.
     #[cfg(feature = "unstable_protocol_v2")]
-    #[must_use]
     fn instantiate_v2_proxies(
         self: Box<Self>,
         req: v2::InitializeRequest,
@@ -1205,7 +1226,6 @@ pub trait InstantiateProxiesAndAgent: Send {
     /// Implementors that only support v1 can rely on the default rejection.
     /// [`AgentOnly`] and [`ProxiesAndAgent`] support both versions.
     #[cfg(feature = "unstable_protocol_v2")]
-    #[must_use]
     fn instantiate_v2_proxies_and_agent(
         self: Box<Self>,
         req: v2::InitializeRequest,
@@ -1876,7 +1896,7 @@ impl ConductorHostRole for Proxy {
     ) -> Result<Handled<Dispatch>, agent_client_protocol::Error> {
         tracing::debug!(
             method = ?message.method(),
-            ?message,
+            id = ?message.id(),
             "ConductorToConductor::handle_dispatch"
         );
         MatchDispatchFrom::new(message, &client_connection)

@@ -32,7 +32,7 @@ impl ConnectTo<Client> for BlockedAdapter {
         let TransportChannel::Bounded(mut channel) = transport else {
             panic!("graceful server must preserve bounded transport");
         };
-        driver.await?;
+        assert!(driver.is_none(), "bare bounded endpoints are passive");
         let init = channel.rx.next().await.expect("initialize frame");
         assert!(matches!(init.decode(), TransportFrame::Single(_)));
         drop(init);
@@ -505,4 +505,87 @@ async fn existing_sse_body_retains_queued_output_after_clean_delete() {
     // then terminate their streams after the final queued event.
     let bytes = checked(axum::body::to_bytes(body, 4096)).await.unwrap();
     assert_eq!(bytes.as_ref(), format!("data: {NOTICE}\n\n").as_bytes());
+}
+
+struct EscapedOutputAdapter {
+    escaped: oneshot::Sender<BoundedSender>,
+    finish: oneshot::Receiver<()>,
+}
+
+impl ConnectTo<Client> for EscapedOutputAdapter {
+    async fn connect_to(
+        self,
+        client: impl ConnectTo<agent_client_protocol::Agent>,
+    ) -> agent_client_protocol::Result<()> {
+        let (transport, driver) = client.into_transport_and_future();
+        assert!(driver.is_none());
+        let TransportChannel::Bounded(mut channel) = transport else {
+            panic!("expected bounded transport");
+        };
+        let init = channel.rx.next().await.expect("initialize frame");
+        drop(init);
+        channel
+            .tx
+            .try_send_serialized(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)?;
+        self.escaped.send(channel.tx.clone()).unwrap();
+        self.finish.await.unwrap();
+        channel.tx.try_send_serialized(NOTICE)?;
+        Ok(())
+    }
+}
+
+async fn owned_completion_with_escaped_producer(graceful: bool) {
+    let (escaped_tx, escaped_rx) = oneshot::channel();
+    let (finish_tx, finish_rx) = oneshot::channel();
+    let adapter = Mutex::new(Some(EscapedOutputAdapter {
+        escaped: escaped_tx,
+        finish: finish_rx,
+    }));
+    let server = BoundedAcpHttpServer::new(
+        move || adapter.lock().unwrap().take().unwrap(),
+        ServerLimits::default(),
+    )
+    .unwrap();
+    let state = if graceful {
+        server.with_graceful_delete(WAIT).state
+    } else {
+        server.state
+    };
+    let id = initialize_connection(state.clone()).await;
+    let escaped = checked(escaped_rx).await.unwrap();
+    let response = checked(handle_get(
+        State(state.clone()),
+        Request::builder()
+            .method("GET")
+            .header(HEADER_CONNECTION_ID, &id)
+            .body(Body::empty())
+            .unwrap(),
+    ))
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body();
+    if graceful {
+        let mut delete = Box::pin(handle_delete(State(state.clone()), delete_request(&id)));
+        assert!(futures::poll!(&mut delete).is_pending());
+        finish_tx.send(()).unwrap();
+        assert_eq!(checked(delete).await.status(), StatusCode::ACCEPTED);
+    } else {
+        finish_tx.send(()).unwrap();
+    }
+    // Do not poll the body until work has been allowed to finish. Clean owned
+    // completion must retain accepted events, even with an escaped sender alive.
+    let bytes = checked(axum::body::to_bytes(body, 4096)).await.unwrap();
+    assert_eq!(bytes.as_ref(), format!("data: {NOTICE}\n\n").as_bytes());
+    assert!(escaped.try_send_serialized(NOTICE).is_err());
+    assert!(!state.connections.lock().unwrap().contains_key(&id));
+}
+
+#[tokio::test]
+async fn graceful_owned_completion_drains_output_with_escaped_producer() {
+    owned_completion_with_escaped_producer(true).await;
+}
+
+#[tokio::test]
+async fn abortive_delete_mode_owned_completion_drains_output_with_escaped_producer() {
+    owned_completion_with_escaped_producer(false).await;
 }

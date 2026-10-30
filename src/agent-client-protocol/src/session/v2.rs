@@ -16,20 +16,39 @@ use crate::{
 #[cfg(feature = "unstable_mcp_over_acp")]
 use crate::{jsonrpc::run::ChainRun, mcp_server::McpServer};
 
+use super::{
+    SessionCleanup, close_session_registrations, drive_session_cleanup,
+    run_attached_session_runner, session_cleanup, session_runner_connection, wait_session_cleanup,
+};
+
 async fn run_pending_session_setup<Counterpart, Run>(
     connection: ConnectionTo<Counterpart>,
     run: Run,
     started_tx: oneshot::Sender<Result<(), crate::Error>>,
     promotion_rx: oneshot::Receiver<()>,
+    cleanup: SessionCleanup,
 ) -> Result<(), crate::Error>
 where
     Counterpart: HasPeer<Agent>,
     Run: RunWithConnectionTo<Counterpart>,
 {
+    let (connection, error_scope) = session_runner_connection(connection, &cleanup);
     let mut run = Box::pin(run.run_with_connection_to(connection));
     let first_poll =
         future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(run.as_mut(), cx)))
             .await;
+    // A composed runner may have observed an immediate error but remain Pending
+    // while its sibling drives owned cleanup. It still failed before publication.
+    if let Some(error) = error_scope.error() {
+        close_session_registrations(&cleanup);
+        if first_poll.is_pending() {
+            drop(drive_session_cleanup(run, cleanup).await);
+        } else {
+            wait_session_cleanup(cleanup).await;
+        }
+        drop(started_tx.send(Err(error)));
+        return Ok(());
+    }
     let readiness = match &first_poll {
         std::task::Poll::Ready(result) => result.clone(),
         std::task::Poll::Pending => Ok(()),
@@ -38,25 +57,39 @@ where
 
     match first_poll {
         std::task::Poll::Ready(Ok(())) => {
-            let _ = promotion_rx.await;
+            if promotion_rx.await.is_err() {
+                close_session_registrations(&cleanup);
+                wait_session_cleanup(cleanup).await;
+            }
             Ok(())
         }
         // The request has not been published yet, so report an immediate
         // startup failure through its readiness result without failing the
         // whole connection.
-        std::task::Poll::Ready(Err(_)) => Ok(()),
+        std::task::Poll::Ready(Err(_)) => {
+            close_session_registrations(&cleanup);
+            wait_session_cleanup(cleanup).await;
+            Ok(())
+        }
         std::task::Poll::Pending => match future::select(run, promotion_rx).await {
             Either::Left((result, promotion_rx)) => {
                 // A Pending first poll releases session setup for publication.
                 // From that point onward the agent may already be using an
                 // attachment, so runner failures are connection-fatal just as
                 // they are for other connection runners.
-                result?;
-                let _ = promotion_rx.await;
-                Ok(())
+                if result.is_err() || promotion_rx.await.is_err() {
+                    close_session_registrations(&cleanup);
+                    wait_session_cleanup(cleanup).await;
+                }
+                result
             }
-            Either::Right((Ok(()), run)) => run.await,
-            Either::Right((Err(_), _run)) => Ok(()),
+            Either::Right((Ok(()), run)) => {
+                run_attached_session_runner(run, cleanup, error_scope).await
+            }
+            Either::Right((Err(_), run)) => {
+                close_session_registrations(&cleanup);
+                run_attached_session_runner(run, cleanup, error_scope).await
+            }
         },
     }
 }
@@ -86,11 +119,13 @@ where
         let handlers_ready = raw_connection.dynamic_handler_barrier();
         let (runner_started_tx, runner_started_rx) = oneshot::channel();
         let (promotion_tx, promotion_rx) = oneshot::channel();
+        let cleanup = session_cleanup(&dynamic_handler_registrations);
         let runner_started = match raw_connection.spawn(run_pending_session_setup(
             raw_connection.clone(),
             run,
             runner_started_tx,
             promotion_rx,
+            cleanup,
         )) {
             Ok(()) => Either::Left(async move {
                 runner_started_rx.await.map_err(|error| {
@@ -263,6 +298,12 @@ where
     /// runner tasks receive an initial poll before `session/new` is published,
     /// allowing the agent to connect while handling session setup. A
     /// successful attachment remains active for the lifetime of the connection.
+    ///
+    /// The declaration is an `acp` transport (`McpServer::Acp`). The agent must
+    /// advertise `session.mcp.acp`, or a compatibility proxy such as
+    /// `McpOverAcpPolyfill` must sit in front of it; otherwise a conforming
+    /// agent rejects the setup request with `-32602`. This method does not
+    /// check the agent's capabilities.
     #[cfg(feature = "unstable_mcp_over_acp")]
     pub fn with_mcp_server<McpRun>(
         mut self,
@@ -431,6 +472,12 @@ where
     /// before `session/fork` is published, allowing the agent to connect while
     /// handling session setup. A successful attachment remains active for the
     /// lifetime of the connection.
+    ///
+    /// The declaration is an `acp` transport (`McpServer::Acp`). The agent must
+    /// advertise `session.mcp.acp`, or a compatibility proxy such as
+    /// `McpOverAcpPolyfill` must sit in front of it; otherwise a conforming
+    /// agent rejects the setup request with `-32602`. This method does not
+    /// check the agent's capabilities.
     #[cfg(feature = "unstable_mcp_over_acp")]
     pub fn with_mcp_server<McpRun>(
         mut self,
@@ -597,6 +644,12 @@ where
     /// published, allowing the agent to use the server during replay and
     /// session setup. A successful attachment remains active for the lifetime
     /// of the connection.
+    ///
+    /// The declaration is an `acp` transport (`McpServer::Acp`). The agent must
+    /// advertise `session.mcp.acp`, or a compatibility proxy such as
+    /// `McpOverAcpPolyfill` must sit in front of it; otherwise a conforming
+    /// agent rejects the setup request with `-32602`. This method does not
+    /// check the agent's capabilities.
     #[cfg(feature = "unstable_mcp_over_acp")]
     pub fn with_mcp_server<McpRun>(
         mut self,
@@ -850,11 +903,22 @@ where
     /// Ask the agent to cancel the session's current foreground work.
     ///
     /// This is independent from cancelling a prompt's [`SentRequest`].
-    /// Cancellation completes when the agent reports an `idle` state update
-    /// with [`v2::StopReason::Cancelled`]. The client should immediately mark
-    /// unfinished tool calls for the active work as cancelled and remains
-    /// responsible for resolving every pending [`v2::RequestPermissionRequest`]
-    /// with the cancelled outcome.
+    /// `session/cancel` covers the session's foreground work and any prompts
+    /// the agent has not yet inserted; those prompt requests fail with
+    /// `-32800` (request cancelled). A prompt whose user message was already
+    /// inserted still succeeds with its `messageId`. Background activity is
+    /// not covered, although the agent may stop it too.
+    ///
+    /// If foreground work was active, cancellation completes when the agent
+    /// reports an `idle` state update with [`v2::StopReason::Cancelled`]; no
+    /// completion update is required when nothing was running. `cancelled` is only
+    /// reported for work the client cancelled, through this notification or
+    /// by closing the session. The client should immediately mark unfinished
+    /// tool calls for the active work as cancelled and must resolve every
+    /// pending [`v2::RequestPermissionRequest`] in the session with the
+    /// cancelled outcome.
+    ///
+    /// See <https://agentclientprotocol.com/protocol/v2/prompt-lifecycle#cancellation>.
     pub fn cancel_active_work(&self) -> Result<(), crate::Error> {
         self.connection.send_notification_to(
             Agent,
@@ -864,8 +928,16 @@ where
 
     /// Set a session configuration option.
     ///
-    /// The response contains the full current option set. It is not cached on
-    /// this command handle.
+    /// Only send a `config_id` the agent advertised for this session, with a
+    /// value from that option. The agent rejects an unknown `config_id` or an
+    /// invalid value with `-32602` and leaves the configuration unchanged.
+    ///
+    /// The response contains the full current option set and is authoritative
+    /// for the requesting client. A duplicate `config_option_update`
+    /// notification for the same change may arrive before the response. The
+    /// response is not cached on this command handle.
+    ///
+    /// See <https://agentclientprotocol.com/protocol/v2/session-config-options>.
     pub fn set_config_option(
         &self,
         config_id: impl Into<v2::SessionConfigId>,
@@ -879,8 +951,19 @@ where
 
     /// Close the remote session and release its resources.
     ///
+    /// The agent cancels the session's ongoing work as if `session/cancel` had
+    /// been sent. When that cancels active foreground work, the agent sends the
+    /// work's final updates and an `idle` state update with stop reason
+    /// `cancelled` before it responds to `session/close`. A pending prompt
+    /// whose user message closing kept from being inserted fails with `-32800`
+    /// (request cancelled); one already inserted still succeeds with its
+    /// message ID. Prompt responses need not precede the close response.
+    ///
     /// Existing clones of this local command handle are not invalidated, but
-    /// the agent should reject subsequent commands for the closed session.
+    /// the session is no longer active: the agent rejects later commands for it,
+    /// and a repeated close, with `-32002` (resource not found).
+    ///
+    /// See <https://agentclientprotocol.com/protocol/v2/session-setup#closing-active-sessions>.
     pub fn close(&self) -> SentRequest<v2::CloseSessionResponse> {
         self.connection
             .send_request_to(Agent, v2::CloseSessionRequest::new(self.session_id.clone()))

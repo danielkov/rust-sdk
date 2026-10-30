@@ -10,6 +10,19 @@
 
 `POST /acp` request bodies are limited to 16 MiB.
 
+## Diagnostic Privacy
+
+Ordinary transport diagnostics use byte lengths, fixed message kinds, stream
+scope, and fixed failure labels rather than message bodies. They do not format
+raw methods, request/session IDs, WebSocket close reasons, or transport error
+text, which can contain prompts, file/image content, or credential-bearing URLs.
+This does not change messages or errors delivered through the protocol.
+
+Opt-in [conductor recordings](./trace-viewer.md#recording-privacy) are different:
+they intentionally retain protocol payloads and must be treated as sensitive.
+This policy covers diagnostics emitted by the HTTP transport crate, not logs
+from applications or underlying libraries.
+
 ## JSON-RPC Batches
 
 `HttpClient` starts every connection with an individual `initialize` and
@@ -69,9 +82,11 @@ stream for that returned session before expecting updates or responses for it.
 The crate does not enable either transport side by default. Opt into only the side(s) you need.
 
 ```toml
-agent-client-protocol-http = { version = "...", features = ["client"] }
-agent-client-protocol-http = { version = "...", features = ["server"] }
-agent-client-protocol-http = { version = "...", features = ["client", "server"] }
+agent-client-protocol-http = { version = "3", features = ["client"] }
+# For a server instead:
+# agent-client-protocol-http = { version = "3", features = ["server"] }
+# To enable both sides:
+# agent-client-protocol-http = { version = "3", features = ["client", "server"] }
 ```
 
 The `client` feature exposes `HttpClient`. The `server` feature exposes
@@ -82,7 +97,7 @@ The `client` feature exposes `HttpClient`. The `server` feature exposes
 Request cancellation is available through the core SDK:
 
 ```toml
-agent-client-protocol-http = { version = "...", features = ["client", "server"] }
+agent-client-protocol-http = { version = "3", features = ["client", "server"] }
 ```
 
 `$/cancel_request` is connection-scoped. The HTTP transport does not apply
@@ -112,12 +127,40 @@ the browser origins that should be able to access the ACP endpoint:
 use agent_client_protocol_http::{AcpHttpServer, CorsOptions, ServerOptions};
 
 let app = AcpHttpServer::new(|| my_agent())
-    .with_options(ServerOptions {
-        cors: CorsOptions::allow_origins(["http://localhost:5173"])?,
-        ..ServerOptions::default()
-    })
+    .with_options(
+        ServerOptions::default()
+            .with_cors(CorsOptions::allow_origins(["http://localhost:5173"])?),
+    )
     .into_router();
 ```
+
+`ServerOptions` is non-exhaustive. Start from `ServerOptions::default()` and use
+`with_path(...)`, `with_cors(...)`, and `with_health_endpoint(...)`; its fields
+remain public for reading and mutation. Defaults remain `/acp`, disabled CORS,
+and an enabled `/health` endpoint. See the [config API migration](./migration-config-api.md)
+for replacing struct literals and update syntax.
+
+### Browser authentication and credential policy
+
+CORS controls browser cross-origin access; it does **not** authenticate clients.
+The WebSocket origin check accepts requests without an `Origin` header, so an
+origin allowlist is not a substitute for authentication.
+
+The built-in CORS policy allows ACP transport headers, but not `Authorization`,
+and does not enable credentialed CORS (`Access-Control-Allow-Credentials`).
+`CorsOptions::allow_any_origin()` is a wildcard origin policy, not an
+authentication or credential policy.
+
+Hosts that need bearer headers, cookies, or another credential policy should
+enforce authentication on the router returned by `into_router()` and supply
+their own CORS layer. Leave `ServerOptions::cors` disabled when providing that
+HTTP CORS layer to avoid stacking conflicting policies. The separate WebSocket
+origin check still uses `CorsOptions`; with the built-in policy disabled it
+rejects upgrades carrying an `Origin` header. Browser WebSocket hosts can use
+an explicit `CorsOptions::allow_origins(...)` allowlist, but a host needing a
+different credentialed HTTP CORS policy and browser WebSocket origins on the
+same endpoint needs additional host routing/policy integration beyond these
+options. This SDK does not provide a general authentication configuration.
 
 ## Client
 
@@ -135,6 +178,165 @@ and it will open a single bidirectional connection instead of using POST + SSE:
 let transport = HttpClient::new("ws://127.0.0.1:8080")?;
 my_client().connect_to(transport).await?;
 ```
+
+The client validates the WebSocket handshake before sending any queued ACP
+messages. This transport does not negotiate WebSocket subprotocols or extensions,
+including compression. Setting `Sec-WebSocket-Protocol` or
+`Sec-WebSocket-Extensions` in custom default headers does not enable support for
+them; a server response selecting either is rejected.
+
+### Client Configuration
+
+Use the client builder to configure headers, proxies, DNS, TLS, and timeouts.
+The configuration is used for both HTTP/SSE requests and WebSocket handshakes:
+
+```rust
+use std::time::Duration;
+use agent_client_protocol_http::HttpClient;
+
+let transport = HttpClient::builder("wss://agent.example")
+    .configure_http(|http| {
+        http.user_agent("my-acp-client")
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10))
+    })
+    .build()?;
+```
+
+`configure_http` transforms the current `reqwest::ClientBuilder`; repeated calls
+retain earlier configuration. Use it for options such as `default_headers`,
+`proxy`, `resolve`, `tls_certs_merge`, and `identity`. It does not open a
+connection. URL validation and HTTP-client construction errors are returned by
+`build()`, before connecting the transport.
+
+`builder(base_url)` uses the same path rule as `new`: append `/acp` unless the
+path already ends with it, after removing trailing slashes. For an exact
+endpoint, including a custom server path or query string, use
+`builder_with_endpoint(endpoint)` instead. `with_endpoint(endpoint)` remains
+the unconfigured convenience constructor.
+
+For WebSocket URLs, the SDK applies HTTP/1.1 and disables redirects **after**
+the configuration callback. These are transport requirements, not defaults a
+callback can override. A redirect fails at the original endpoint without sending
+handshake headers to its destination; resolve the intended WebSocket endpoint
+before connecting. HTTP/SSE retains the caller's HTTP-version and redirect
+settings.
+
+#### Proxy Headers
+
+For WebSocket clients, **do not set `Host`, `Connection`, `Upgrade`, or any
+`Sec-WebSocket-*` header through `reqwest::Proxy::headers`**. Use that API only
+for non-handshake headers required by the proxy; proxy authentication can use
+`Proxy::basic_auth` or `custom_http_auth`.
+
+The SDK explicitly sets `Connection`, `Upgrade`, `Sec-WebSocket-Version`, and
+`Sec-WebSocket-Key` over `default_headers`, but reqwest applies non-tunnel proxy
+headers afterward on plain `ws://` requests and can overwrite those values.
+The callback's proxy configuration is opaque: the SDK cannot
+inspect, sanitize, or reject those settings at `build()`. This is a caller
+configuration constraint, not an enforced builder restriction. Upgrade response
+validation still precedes ACP data; it does not prove that every request header
+was unchanged. For example, replacing the random key causes a response computed
+from the replacement key to fail accept validation, but other reserved-header
+overrides are not necessarily detected. For `wss://`, proxy headers apply to the
+CONNECT request rather than the tunneled WebSocket handshake.
+
+Reqwest's connection timeout covers connection establishment. Its request/read
+timeouts also cover the opening WebSocket handshake but do not impose a lifetime
+or idle timeout on the upgraded socket. For HTTP/SSE, request/read timeouts retain
+their normal reqwest semantics, including the long-lived SSE response body.
+
+For custom trust roots and client certificates, prefer reqwest's TLS options.
+If using `tls_backend_preconfigured`, configure that backend's ALPN for
+HTTP/1.1 yourself: reqwest does not rewrite a preconfigured TLS backend's ALPN,
+even when HTTP/1.1 is selected on its builder. For rustls, set
+`ClientConfig::alpn_protocols` to `vec![b"http/1.1".to_vec()]`. Incompatible
+negotiation is rejected before any ACP messages are sent; HTTP/2 and HTTP/3
+WebSocket negotiation is not implemented.
+
+### Reusing an HTTP Client
+
+To share an already-built reqwest client and its connection pool, use the
+HTTP/SSE-only constructor with an **exact endpoint**, including `/acp` or the
+server's custom path:
+
+```rust
+let http = reqwest::Client::builder().build()?;
+let transport = HttpClient::from_http_client(
+    "https://agent.example/acp",
+    http.clone(),
+)?;
+```
+
+`from_http_client` rejects `ws://` and `wss://` URLs before any network request.
+An already-built reqwest client cannot be reconfigured to enforce the
+WebSocket connection policies. Use the SDK builder for those URLs.
+
+`HttpClient` itself can also be cloned to reuse its endpoint and underlying
+HTTP client. Each connection has independent ACP transport state.
+
+### Migrating Custom Client Construction
+
+`HttpClient::with_client(base_url, client)` and
+`with_endpoint_and_client(endpoint, client)` remain available but are deprecated.
+Existing HTTP/SSE calls keep their path handling, supplied client, and connection
+pool. They emit a deprecation warning so applications can migrate incrementally.
+
+For `ws://` and `wss://`, both deprecated constructors now return
+`HttpClientError::WebSocketRequiresBuilder` before any network I/O. Those callers
+must migrate to the builder: retaining the old signatures cannot make an opaque,
+already-built reqwest client enforce the WebSocket connection policies.
+
+- For HTTP/SSE or WebSocket configuration, move the reqwest builder settings into
+  `HttpClient::builder(base_url).configure_http(|http| ...).build()`. Do not call
+  reqwest's `build()` inside the callback.
+- For an exact endpoint, use `builder_with_endpoint(endpoint)` instead.
+- To retain a shared, already-built HTTP/SSE client, use
+  `from_http_client(exact_endpoint, client)`. Unlike the old base-URL constructor,
+  this does not append `/acp`.
+- Code using `new` or `with_endpoint` needs no source changes, but WebSocket
+  proxy discovery and TLS trust defaults change as described below.
+
+#### WebSocket Proxy and TLS Defaults
+
+Unconfigured WebSockets intentionally share reqwest's defaults with HTTP/SSE.
+Previously, the tungstenite connection was direct and WSS used bundled WebPKI
+roots. Now `new`, `with_endpoint`, and unconfigured builders discover environment
+proxies, honor system proxies when reqwest's `system-proxy` feature is enabled,
+and use reqwest's TLS verifier. With this SDK's rustls feature selection, that
+is platform certificate verification instead of the old bundled roots. Downstream
+reqwest feature selection and explicit TLS configuration can affect this behavior.
+Consequently, an unchanged WebSocket URL may take a different network route or
+trust a different set of certificate authorities.
+
+To disable proxy discovery and explicitly supplied proxies, opt into a direct
+connection:
+
+```rust
+let transport = HttpClient::builder("wss://agent.example")
+    .configure_http(|http| http.no_proxy())
+    .build()?;
+```
+
+For deterministic trust, supply the application's root certificates with
+reqwest 0.13's `tls_certs_only`, which disables platform/built-in roots:
+
+```rust
+use agent_client_protocol_http::HttpClient;
+
+fn direct_with_root(root_pem: &[u8]) -> Result<HttpClient, Box<dyn std::error::Error>> {
+    let root = reqwest::Certificate::from_pem(root_pem)?;
+    Ok(HttpClient::builder("wss://agent.example")
+        .configure_http(|http| http.no_proxy().tls_certs_only([root]))
+        .build()?)
+}
+```
+
+Supply the complete root set you intend to trust; this example does not recreate
+the old bundled WebPKI root set. Use `tls_certs_merge([root])` instead to add
+private roots while retaining the selected verifier's default trust. Do not disable
+certificate validation to work around a trust-store difference. The
+[proxy-header constraint](#proxy-headers) applies when explicitly configuring proxies.
 
 ## Opt-in Bounded HTTP/SSE
 

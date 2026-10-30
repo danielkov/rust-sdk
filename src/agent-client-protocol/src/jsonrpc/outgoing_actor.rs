@@ -77,7 +77,8 @@ pub(crate) fn send_raw_message(
     tx: &OutgoingMessageTx,
     message: OutgoingMessage,
 ) -> Result<(), crate::Error> {
-    tracing::debug!(?message, ?tx, "send_raw_message");
+    let (kind, method, id) = message.log_summary();
+    tracing::debug!(kind, method, ?id, ?tx, "send_raw_message");
     tx.unbounded_send(message)
         .map_err(crate::util::internal_error)
 }
@@ -135,6 +136,7 @@ pub(super) async fn outgoing_protocol_actor(
     pending_replies: PendingReplies,
     transport_tx: impl Into<crate::bounded::TransportSender>,
     protocol_compat: ProtocolCompat,
+    foreground_done: super::SharedCompletionSignal,
 ) -> Result<(), crate::Error> {
     let transport_tx = transport_tx.into();
     let bounded = matches!(&transport_tx, crate::bounded::TransportSender::Bounded(_));
@@ -160,7 +162,8 @@ pub(super) async fn outgoing_protocol_actor(
             }
             _ => {}
         }
-        tracing::debug!(?message, "outgoing_protocol_actor");
+        let (kind, method, id) = message.log_summary();
+        tracing::debug!(kind, method, ?id, "outgoing_protocol_actor");
 
         // Create the message to be sent over the transport
         let (json_rpc_message, destination, receipt) = match message {
@@ -221,19 +224,35 @@ pub(super) async fn outgoing_protocol_actor(
                     continue;
                 }
 
-                if let Some(readiness) = readiness
-                    && let Err(error) = readiness.await
-                {
-                    tracing::warn!(
-                        ?id,
-                        %method,
-                        ?error,
-                        "Outgoing request readiness failed"
-                    );
-                    if let Some(pending_reply) = pending_replies.remove(&id) {
-                        pending_reply.fail(error);
+                if let Some(readiness) = readiness {
+                    // A route-installation gate may depend on an application
+                    // handler that never returns. Foreground success cancels
+                    // unresolved gates, but ready gates still publish in FIFO
+                    // order; shutdown must never bypass route readiness.
+                    // Poll a fresh clone for each gate: a Shared handle that
+                    // returned Ready cannot itself be polled a second time.
+                    let result =
+                        match futures::future::select(Box::pin(readiness), foreground_done.clone())
+                            .await
+                        {
+                            futures::future::Either::Left((result, _)) => result,
+                            futures::future::Either::Right(((), _)) => {
+                                Err(crate::Error::internal_error()
+                                    .data("foreground completed before outgoing request readiness"))
+                            }
+                        };
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            ?id,
+                            %method,
+                            error = ?crate::util::redacted_error(error.code),
+                            "Outgoing request readiness failed"
+                        );
+                        if let Some(pending_reply) = pending_replies.remove(&id) {
+                            pending_reply.fail(error);
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
                 if !pending_replies.contains(&id) {
@@ -247,7 +266,7 @@ pub(super) async fn outgoing_protocol_actor(
                 {
                     Ok(request) => request,
                     Err(error) => {
-                        tracing::warn!(?id, %method, ?error, "Failed to prepare outgoing request");
+                        tracing::warn!(?id, %method, error = ?crate::util::redacted_error(error.code), "Failed to prepare outgoing request");
                         if let Some(pending_reply) = pending_replies.remove(&id) {
                             pending_reply.fail(error);
                         }
@@ -279,7 +298,7 @@ pub(super) async fn outgoing_protocol_actor(
                             return Err(error);
                         }
                         tracing::warn!(
-                            ?error,
+                            error = ?crate::util::redacted_error(error.code),
                             "Dropping outgoing notification after preparation failed"
                         );
                         continue;
@@ -294,7 +313,7 @@ pub(super) async fn outgoing_protocol_actor(
                                 return Err(error);
                             }
                             tracing::warn!(
-                                ?error,
+                                error = ?crate::util::redacted_error(error.code),
                                 "Dropping outgoing notification after serialization failed"
                             );
                             continue;
@@ -325,7 +344,7 @@ pub(super) async fn outgoing_protocol_actor(
                     )
                 }
                 Err(error) => {
-                    tracing::warn!(?id, %method, ?error, "Sending error response");
+                    tracing::warn!(?id, %method, error = ?crate::util::redacted_error(error.code), "Sending error response");
                     (
                         RawJsonRpcMessage::response(id, Err(error)),
                         destination,

@@ -1,4 +1,5 @@
 // Types re-exported from crate root
+use futures::FutureExt as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use futures::stream;
@@ -18,6 +19,7 @@ use crate::jsonrpc::PendingReplies;
 use crate::jsonrpc::PendingReply;
 use crate::jsonrpc::RawJsonRpcMessage;
 use crate::jsonrpc::RawJsonRpcParams;
+use crate::jsonrpc::RawJsonRpcResponse as Response;
 use crate::jsonrpc::RequestReplyTarget;
 use crate::jsonrpc::Responder;
 use crate::jsonrpc::ResponseDestination;
@@ -32,7 +34,7 @@ use crate::jsonrpc::protocol_compat::ProtocolCompat;
 use crate::jsonrpc::{is_response_only_shape, raw_is_response_only_shape};
 
 use crate::role::Role;
-use crate::schema::v1::{RequestId, Response};
+use crate::schema::v1::RequestId;
 
 use super::Handled;
 
@@ -40,11 +42,20 @@ use super::Handled;
 pub(super) struct IncomingHandlers<Message, Close> {
     messages: Message,
     close: Close,
+    foreground_succeeded: super::SharedCompletionSignal,
 }
 
 impl<Message, Close> IncomingHandlers<Message, Close> {
-    pub(super) fn new(messages: Message, close: Close) -> Self {
-        Self { messages, close }
+    pub(super) fn new(
+        messages: Message,
+        close: Close,
+        foreground_succeeded: super::SharedCompletionSignal,
+    ) -> Self {
+        Self {
+            messages,
+            close,
+            foreground_succeeded,
+        }
     }
 }
 
@@ -71,6 +82,7 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
     let IncomingHandlers {
         messages: mut handler,
         close: on_close,
+        foreground_succeeded,
     } = handlers;
 
     // `merge` does not expose when one of its source streams ends. Preserve
@@ -80,8 +92,9 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
         transport_rx.map(|frame| IncomingProtocolMsg::Transport(frame.into())),
         stream::iter([IncomingProtocolMsg::TransportClosed]),
     );
-    let mut my_rx =
+    let my_rx =
         transport_with_close.merge(dynamic_handler_rx.map(IncomingProtocolMsg::DynamicHandler));
+    let mut my_rx = std::pin::pin!(my_rx);
 
     let mut dynamic_handlers: FxHashMap<Uuid, Box<dyn DynHandleDispatchFrom<Counterpart>>> =
         FxHashMap::default();
@@ -105,7 +118,20 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
         if pending_messages.is_empty() {
             pending_frame_charges.clear();
         }
-        tracing::trace!(message = ?message_result, actor = "incoming_protocol_actor");
+        // Check after the receive await as well: success may have occurred
+        // while this actor was waiting for its next message/EOF. The caller
+        // cancels a blocked message handler, but protects an underway close
+        // callback. Neither path may start another delivery after success.
+        if foreground_succeeded.clone().now_or_never().is_some() {
+            break;
+        }
+        // Frames carry payloads; the transport actor already traced them redacted.
+        let event = match &message_result {
+            IncomingProtocolMsg::Transport(_) => "transport_frame",
+            IncomingProtocolMsg::TransportClosed => "transport_closed",
+            IncomingProtocolMsg::DynamicHandler(_) => "dynamic_handler",
+        };
+        tracing::trace!(event, actor = "incoming_protocol_actor");
         match message_result {
             IncomingProtocolMsg::TransportClosed => {
                 connection.begin_incoming_close();
@@ -220,15 +246,18 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
                         Ok(RawJsonRpcMessage::Response(response)) => {
                             let (id, result) = match response {
                                 Response::Result { id, result } => (id, Ok(result)),
-                                Response::Error { id, error } => (id, Err(error)),
+                                Response::Error { id, error } => (id, Err(error.into_acp_error())),
                             };
 
                             tracing::trace!(?id, "Handling response");
                             if let Some(pending_reply) = pending_replies.remove(&id) {
-                                let result = protocol_compat
-                                    .incoming_response(&pending_reply.method, result);
+                                let result = protocol_compat.incoming_response(
+                                    &pending_reply.method,
+                                    pending_reply.accepts_lower_initialize_version,
+                                    result,
+                                );
                                 let (dispatch, response_dispatch) =
-                                    dispatch_from_response(id, pending_reply, result);
+                                    dispatch_from_response(pending_reply, result);
                                 if let Dispatch::Response(_, router) = &dispatch {
                                     router.reply_target.retain_incoming(&charges);
                                 }
@@ -290,7 +319,7 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
                         }
                         Err(error) => {
                             tracing::warn!(
-                                ?error,
+                                error = ?crate::util::redacted_error(error.code),
                                 "Invalid transport input, sending error response"
                             );
                             let destination = destination.expect(
@@ -353,7 +382,7 @@ async fn handle_dynamic_handler_message<Counterpart: Role>(
                         new_pending_messages.push(m);
                     }
                     Err(err) => {
-                        tracing::warn!(?err, handler = ?handler.dyn_describe_chain(), "Dynamic handler errored on pending message");
+                        tracing::warn!(%method, err = ?crate::util::redacted_error(err.code), handler = ?handler.dyn_describe_chain(), "Dynamic handler errored on pending message");
                         handle_handler_error(connection, reply_target, method, err)?;
                     }
                 }
@@ -502,14 +531,13 @@ fn dispatch_from_message<Counterpart: Role>(
 /// the awaiting code. The default behavior is to forward the response to the
 /// local awaiter via the oneshot channel.
 pub(super) fn dispatch_from_response(
-    id: RequestId,
     pending_reply: PendingReply,
     result: Result<serde_json::Value, crate::Error>,
 ) -> (Dispatch, ResponseDispatch) {
     let response_dispatch = ResponseDispatch::default();
 
     // Create a Dispatch::Response with a ResponseRouter that routes to the oneshot
-    let router = ResponseRouter::new(id.clone(), pending_reply, response_dispatch.clone());
+    let router = ResponseRouter::new(pending_reply, response_dispatch.clone());
     (Dispatch::Response(result, router), response_dispatch)
 }
 
@@ -527,7 +555,7 @@ async fn dispatch_dispatch<Counterpart: Role>(
     pending_messages: &mut Vec<Dispatch>,
     request_cancellations: &super::RequestCancellationRegistry,
 ) -> Result<(), crate::Error> {
-    tracing::trace!(?dispatch, "dispatch_dispatch");
+    tracing::trace!(method = dispatch.method(), id = ?dispatch.id(), "dispatch_dispatch");
 
     let mut retry_any = false;
 
@@ -547,7 +575,7 @@ async fn dispatch_dispatch<Counterpart: Role>(
             tracing::warn!(
                 ?method,
                 ?id,
-                ?err,
+                err = ?crate::util::redacted_error(err.code),
                 "Request cancellation notification errored"
             );
             return handle_handler_error(connection, error_target, method, err);
@@ -572,7 +600,7 @@ async fn dispatch_dispatch<Counterpart: Role>(
         }
 
         Err(err) => {
-            tracing::warn!(?method, ?id, ?err, handler = ?handler.describe_chain(), "Handler errored");
+            tracing::warn!(?method, ?id, err = ?crate::util::redacted_error(err.code), handler = ?handler.describe_chain(), "Handler errored");
             return handle_handler_error(connection, error_target, method, err);
         }
     }
@@ -596,7 +624,7 @@ async fn dispatch_dispatch<Counterpart: Role>(
             }
 
             Err(err) => {
-                tracing::warn!(?method, ?id, ?err, handler = ?dynamic_handler.dyn_describe_chain(), "Dynamic handler errored");
+                tracing::warn!(?method, ?id, err = ?crate::util::redacted_error(err.code), handler = ?dynamic_handler.dyn_describe_chain(), "Dynamic handler errored");
                 return handle_handler_error(connection, error_target, method, err);
             }
         }
@@ -621,7 +649,7 @@ async fn dispatch_dispatch<Counterpart: Role>(
             tracing::warn!(
                 ?method,
                 ?id,
-                ?err,
+                err = ?crate::util::redacted_error(err.code),
                 handler = "default",
                 "Default handler errored"
             );
@@ -650,6 +678,13 @@ async fn dispatch_dispatch<Counterpart: Role>(
             }
             Dispatch::Request(_, responder) => {
                 tracing::info!(?method, "Rejecting request with error, no handler");
+                #[cfg(feature = "unstable_mcp_over_acp")]
+                if method == "mcp/message" {
+                    return responder.respond_with_error(crate::Error::new(
+                        crate::mcp_server::MCP_SERVER_UNAVAILABLE,
+                        "MCP server registration unavailable",
+                    ));
+                }
                 responder.respond_with_error(crate::Error::method_not_found().data(method))
             }
             Dispatch::Response(result, router) => {
@@ -689,7 +724,7 @@ fn handle_handler_error<Counterpart: Role>(
         None => {
             tracing::warn!(
                 %method,
-                ?error,
+                error = ?crate::util::redacted_error(error.code),
                 "Ignoring message-processing error because there is no request to answer"
             );
             Ok(())

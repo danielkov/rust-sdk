@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [3.4.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-polyfill-v3.3.0...agent-client-protocol-polyfill-v3.4.0) - 2026-10-16
+
+### Fixed
+
+- *(deps)* upgrade hmac and sha2 together ([#422](https://github.com/agentclientprotocol/rust-sdk/pull/422))
+
+## [3.0.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-polyfill-v2.2.0...agent-client-protocol-polyfill-v3.0.0) - 2026-10-06
+
+### Added
+
+- *(acp)* [**breaking**] adopt request-scoped MCP binding ([#388](https://github.com/agentclientprotocol/rust-sdk/pull/388))
+
+### Fixed
+
+- *(polyfill)* bound request-scoped HTTP resources ([#389](https://github.com/agentclientprotocol/rust-sdk/pull/389))
+- *(acp)* [**breaking**] preserve connection lifetimes and graceful drain ([#385](https://github.com/agentclientprotocol/rust-sdk/pull/385))
+- *(acp)* [**breaking**] preserve protocol-neutral raw JSON-RPC errors ([#384](https://github.com/agentclientprotocol/rust-sdk/pull/384))
+
+### Other
+
+- omit peer-controlled HTTP responses from test failure logs ([#405](https://github.com/agentclientprotocol/rust-sdk/pull/405))
+- prepare v3 package metadata and release guidance ([#404](https://github.com/agentclientprotocol/rust-sdk/pull/404))
+- slim dependency features and CI validation ([#399](https://github.com/agentclientprotocol/rust-sdk/pull/399))
+- reconcile combined breaking release migrations ([#395](https://github.com/agentclientprotocol/rust-sdk/pull/395))
+
+### Breaking changes
+
+- Replace the native MCP HTTP bridge with MCP 2026-07-28-only request-scoped
+  HTTP POSTs, fresh logical request IDs, per-request notifications, and
+  cancellation when the HTTP response stream is dropped. Remove the connection
+  handshake and legacy MCP session/initialization behavior. There is no fallback
+  to older MCP revisions; downstream HTTP clients must support MCP 2026-07-28.
+  See the [bridge guide](https://agentclientprotocol.github.io/rust-sdk/mcp-bridge.html).
+
+### Changed
+
+- Limit Axum to HTTP1/Tokio, JSON responses, and tracing/tower-log observability;
+  remove unused extractors and the unused futures executor feature.
+- Use one loopback listener per ACP connection with server-addressed URLs and
+  server-specific HMAC bearer credentials in declaration headers. Validate
+  authentication and Origin before reading request bodies.
+- Re-export native tool schemas without transport-only `x-mcp-header`
+  annotations, preserving argument properties, examples, and defaults.
+- Bound HTTP admission to 64 outstanding response bodies, each operation's
+  notification queue to 16 events and 256 KiB, and request/terminal payloads
+  to 1 MiB. Hold admission through body consumption or drop, including error
+  responses. Overflow reports a resource error and cancels only that operation.
+
+### Fixed
+
+- Preserve raw JSON-RPC error codes, omitted/null data, and error extension
+  fields in the MCP HTTP bridge instead of interpreting them as ACP errors.
+- Keep inner MCP outcomes separate from outer ACP binding failures, preserve
+  external JSON-RPC IDs, and rewrite only the standard subscription metadata.
+
 ## [2.2.0](https://github.com/agentclientprotocol/rust-sdk/compare/agent-client-protocol-polyfill-v2.1.0...agent-client-protocol-polyfill-v2.2.0) - 2026-09-18
 
 ### Other

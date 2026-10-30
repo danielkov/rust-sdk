@@ -5,6 +5,8 @@ mod client;
 #[cfg(feature = "server")]
 mod connection;
 #[cfg(feature = "server")]
+mod diagnostics;
+#[cfg(feature = "server")]
 mod http_server;
 #[cfg(any(feature = "client", feature = "server"))]
 mod protocol;
@@ -14,7 +16,9 @@ mod server;
 mod websocket_server;
 
 #[cfg(feature = "client")]
-pub use client::{BoundedHttpClient, HttpClient, HttpClientError, HttpClientLimits};
+pub use client::{
+    BoundedHttpClient, HttpClient, HttpClientBuilder, HttpClientError, HttpClientLimits,
+};
 #[cfg(feature = "server")]
 pub use server::{
     AcpHttpServer, BoundedAcpHttpServer, CorsOptions, ServerLimits, ServerLimitsError,

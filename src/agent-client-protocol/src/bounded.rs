@@ -485,6 +485,21 @@ pub struct BoundedReceiver {
     budget: Budget,
     failure: Failure,
 }
+impl BoundedReceiver {
+    /// Gracefully seal this receive direction against further admission.
+    ///
+    /// New sends, including sends through cloned producers, are rejected and
+    /// waiting sends are woken. Already accepted frames remain available from
+    /// this receiver and retain their admission charges until released. Continue
+    /// polling the receiver to drain those frames before it returns `None`.
+    ///
+    /// Closing is idempotent. It does not signal terminal failure or close the
+    /// opposite direction of the channel.
+    pub fn close(&mut self) {
+        self.budget.close_admission();
+        self.rx.close();
+    }
+}
 impl Drop for BoundedReceiver {
     fn drop(&mut self) {
         let waiters = {
@@ -564,6 +579,45 @@ impl BoundedChannel {
         self.tx.limits()
     }
 }
+impl BoundedChannel {
+    /// Drive owned work concurrently, closing admission and draining accepted
+    /// output when it succeeds. No driver means independent half-close lifetime.
+    async fn copy_with_driver(
+        mut self,
+        mut driver: Option<crate::ConnectionDriver>,
+    ) -> Result<(), Error> {
+        use futures::future::Either;
+        let mut done = false;
+        loop {
+            let event = futures::future::poll_fn(|cx| {
+                if !done
+                    && let Some(driver) = driver.as_mut()
+                    && let Poll::Ready(result) = Pin::new(driver).poll(cx)
+                {
+                    return Poll::Ready(Either::Left(result));
+                }
+                self.rx.poll_next_unpin(cx).map(Either::Right)
+            })
+            .await;
+            match event {
+                Either::Left(result) => {
+                    result?;
+                    done = true;
+                    self.rx.close();
+                }
+                Either::Right(Some(frame)) => self.tx.try_forward(frame)?,
+                Either::Right(None) => break,
+            }
+        }
+        self.rx.budget.check()?;
+        drop(self);
+        if !done && let Some(driver) = driver {
+            driver.await?;
+        }
+        Ok(())
+    }
+}
+
 /// Additive transport boundary. The legacy variant has no admission guarantee.
 #[derive(Debug)]
 pub enum TransportChannel {
@@ -580,40 +634,56 @@ impl<R: Role> ConnectTo<R> for BoundedChannel {
             }
             rx.budget.check()
         }
-        let (other, future) = client.into_bounded_channel_and_future(self.limits())?;
-        futures::try_join!(copy(self.rx, other.tx), copy(other.rx, self.tx), future)?;
-        Ok(())
+        let (other, driver) = client.into_bounded_channel_and_future(self.limits())?;
+        let passive = driver.is_none();
+        let outgoing = Box::pin(
+            BoundedChannel {
+                rx: other.rx,
+                tx: self.tx,
+            }
+            .copy_with_driver(driver),
+        );
+        let incoming = Box::pin(copy(self.rx, other.tx));
+        if passive {
+            futures::try_join!(outgoing, incoming)?;
+            return Ok(());
+        }
+        match futures::future::select(outgoing, incoming).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right((result, outgoing)) => {
+                result?;
+                outgoing.await
+            }
+        }
     }
-    fn into_channel_and_future(self) -> (Channel, BoxFuture<'static, Result<(), Error>>) {
+
+    fn into_channel_and_future(self) -> (Channel, Option<crate::ConnectionDriver>) {
         drop(self);
         let (channel, peer) = Channel::duplex();
         drop(peer);
         (
             channel,
-            async {
+            Some(crate::ConnectionDriver::new(async {
                 Err(limit_error(
                     "bounded channel cannot be extracted as legacy Channel",
                 ))
-            }
-            .boxed(),
+            })),
         )
     }
-    fn into_transport_and_future(
-        self,
-    ) -> (TransportChannel, BoxFuture<'static, Result<(), Error>>) {
-        (TransportChannel::Bounded(self), async { Ok(()) }.boxed())
+    fn into_transport_and_future(self) -> (TransportChannel, Option<crate::ConnectionDriver>) {
+        (TransportChannel::Bounded(self), None)
     }
     fn into_bounded_channel_and_future(
         self,
         limits: ChannelLimits,
-    ) -> Result<(BoundedChannel, BoxFuture<'static, Result<(), Error>>), Error> {
+    ) -> Result<(BoundedChannel, Option<crate::ConnectionDriver>), Error> {
         let limits = limits.validate()?;
         if self.limits() != limits {
             return Err(self
                 .tx
                 .fail("bounded endpoint limits differ from requested limits"));
         }
-        Ok((self, async { Ok(()) }.boxed()))
+        Ok((self, None))
     }
 }
 
@@ -708,24 +778,44 @@ impl TransportSender {
         }
     }
 }
+pub(crate) enum TransportReceiver {
+    Legacy(mpsc::UnboundedReceiver<TransportFrame>),
+    Bounded(BoundedReceiver),
+}
+impl TransportReceiver {
+    pub(crate) fn close(&mut self) {
+        match self {
+            Self::Legacy(rx) => rx.close(),
+            Self::Bounded(rx) => rx.close(),
+        }
+    }
+}
+impl Stream for TransportReceiver {
+    type Item = IncomingFrame;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match self.get_mut() {
+            Self::Legacy(rx) => Pin::new(rx)
+                .poll_next(cx)
+                .map(|item| item.map(IncomingFrame::from)),
+            Self::Bounded(rx) => Pin::new(rx)
+                .poll_next(cx)
+                .map(|item| item.map(IncomingFrame::from)),
+        }
+    }
+}
+
 impl TransportChannel {
-    pub(crate) fn split(
-        self,
-    ) -> (
-        futures::stream::BoxStream<'static, IncomingFrame>,
-        TransportSender,
-        Option<Budget>,
-    ) {
+    pub(crate) fn split(self) -> (TransportReceiver, TransportSender, Option<Budget>) {
         match self {
             Self::Legacy(channel) => (
-                channel.rx.map(IncomingFrame::from).boxed(),
+                TransportReceiver::Legacy(channel.rx),
                 TransportSender::Legacy(channel.tx),
                 None,
             ),
             Self::Bounded(channel) => {
                 let budget = channel.tx.budget.clone();
                 (
-                    channel.rx.map(IncomingFrame::from).boxed(),
+                    TransportReceiver::Bounded(channel.rx),
                     TransportSender::Bounded(channel.tx),
                     Some(budget),
                 )
@@ -781,6 +871,61 @@ mod tests {
 
     fn small_frame(id: usize) -> TransportFrame {
         TransportFrame::parse_json(&format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{{}}}}"#))
+    }
+
+    #[test]
+    fn receiver_close_seals_admission_and_preserves_both_directions_frames() {
+        let (mut a, mut b) = BoundedChannel::duplex(limits()).unwrap();
+        let producer = a.tx.clone();
+        a.tx.try_send(small_frame(1)).unwrap();
+        b.rx.close();
+        b.rx.close();
+        assert!(producer.try_send(small_frame(2)).is_err());
+        assert!(a.tx.failure().now_or_never().is_none());
+        assert!(b.rx.next().now_or_never().unwrap().is_some());
+        assert!(b.rx.next().now_or_never().unwrap().is_none());
+        b.tx.try_send(small_frame(3)).unwrap();
+        assert!(a.rx.next().now_or_never().unwrap().is_some());
+        assert!(b.tx.failure().now_or_never().is_none());
+    }
+
+    #[test]
+    fn owned_driver_completion_drains_accepted_output_with_live_producers() {
+        let (source, source_peer) = BoundedChannel::duplex(limits()).unwrap();
+        let (destination, mut destination_peer) = BoundedChannel::duplex(limits()).unwrap();
+        source_peer.tx.try_send(small_frame(1)).unwrap();
+        let bridge = BoundedChannel {
+            rx: source.rx,
+            tx: destination.tx,
+        };
+        let driver = crate::ConnectionDriver::new(async { Ok(()) });
+        assert!(
+            bridge
+                .copy_with_driver(Some(driver))
+                .now_or_never()
+                .unwrap()
+                .is_ok()
+        );
+        assert!(destination_peer.rx.next().now_or_never().unwrap().is_some());
+        assert!(source_peer.tx.try_send(small_frame(2)).is_err());
+        assert!(source_peer.tx.failure().now_or_never().is_none());
+    }
+
+    #[test]
+    fn passive_bridge_does_not_treat_absent_driver_as_completion() {
+        let (source, source_peer) = BoundedChannel::duplex(limits()).unwrap();
+        let (destination, mut destination_peer) = BoundedChannel::duplex(limits()).unwrap();
+        let bridge = BoundedChannel {
+            rx: source.rx,
+            tx: destination.tx,
+        };
+        let mut copying = Box::pin(bridge.copy_with_driver(None));
+        assert!(copying.as_mut().now_or_never().is_none());
+        source_peer.tx.try_send(small_frame(1)).unwrap();
+        assert!(copying.as_mut().now_or_never().is_none());
+        assert!(destination_peer.rx.next().now_or_never().unwrap().is_some());
+        source_peer.tx.close_channel();
+        assert!(copying.now_or_never().unwrap().is_ok());
     }
 
     #[tokio::test]
@@ -1201,7 +1346,7 @@ mod tests {
         let (a, _b) = BoundedChannel::duplex(limits()).unwrap();
         let (mut channel, future) =
             <BoundedChannel as ConnectTo<crate::UntypedRole>>::into_channel_and_future(a);
-        assert!(future.now_or_never().unwrap().is_err());
+        assert!(future.unwrap().now_or_never().unwrap().is_err());
         assert!(channel.rx.next().now_or_never().unwrap().is_none());
     }
 }

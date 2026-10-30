@@ -224,13 +224,27 @@ pub mod v2_one_shot_prompt {
     //!             agent_client_protocol::on_receive_notification!(),
     //!         )
     //!         .on_receive_request(
-    //!             async move |_request: v2::RequestPermissionRequest,
+    //!             async move |request: v2::RequestPermissionRequest,
     //!                         responder: Responder<v2::RequestPermissionResponse>,
-    //!                         _connection: V2ConnectionTo<Agent>| {
+    //!                         connection: V2ConnectionTo<Agent>| {
     //!                 // This non-interactive recipe rejects permission requests.
-    //!                 responder.respond(v2::RequestPermissionResponse::new(
-    //!                     v2::RequestPermissionOutcome::Cancelled,
-    //!                 ))
+    //!                 let reject_once = request
+    //!                     .options
+    //!                     .iter()
+    //!                     .find(|option| option.kind == v2::PermissionOptionKind::RejectOnce);
+    //!                 let outcome = match reject_once {
+    //!                     Some(option) => v2::RequestPermissionOutcome::Selected(
+    //!                         v2::SelectedPermissionOutcome::new(option.option_id.clone()),
+    //!                     ),
+    //!                     // `cancelled` is only valid after cancelling the work.
+    //!                     None => {
+    //!                         connection.send_notification(v2::CancelSessionNotification::new(
+    //!                             request.session_id.clone(),
+    //!                         ))?;
+    //!                         v2::CancelledPermissionOutcome::new().into()
+    //!                     }
+    //!                 };
+    //!                 responder.respond(v2::RequestPermissionResponse::new(outcome))
     //!             },
     //!             agent_client_protocol::on_receive_request!(),
     //!         )
@@ -258,22 +272,22 @@ pub mod v2_one_shot_prompt {
     //!             session.send_prompt(prompt).block_task().await?;
     //!
     //!             let mut projection = AgentTextProjection::default();
-    //!             let mut observed_running = false;
+    //!             let mut observed_active = false;
     //!             while let Some(notification) = update_rx.next().await {
     //!                 if &notification.session_id != session.session_id() {
     //!                     continue;
     //!                 }
     //!                 match notification.update {
-    //!                     v2::SessionUpdate::StateUpdate(v2::StateUpdate::Running(_)) => {
-    //!                         observed_running = true;
+    //!                     v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_)) => {
+    //!                         if observed_active {
+    //!                             session.close().block_task().await?;
+    //!                             return Ok(projection.text());
+    //!                         }
     //!                     }
-    //!                     v2::SessionUpdate::StateUpdate(v2::StateUpdate::Idle(_))
-    //!                         if observed_running =>
-    //!                     {
-    //!                         session.close().block_task().await?;
-    //!                         return Ok(projection.text());
-    //!                     }
-    //!                     update if observed_running => projection.apply(update),
+    //!                     // Running, requires_action, and unrecognized states all
+    //!                     // mean foreground work is active, never idle.
+    //!                     v2::SessionUpdate::StateUpdate(_) => observed_active = true,
+    //!                     update if observed_active => projection.apply(update),
     //!                     _ => {}
     //!                 }
     //!             }
@@ -349,12 +363,18 @@ pub mod connecting_as_client {
     //! ```ignore
     //! Client.builder()
     //!     .on_receive_request(async |req: RequestPermissionRequest, responder, _connection| {
-    //!         // Auto-approve by selecting the first option (YOLO mode)
-    //!         let option_id = req.options.first().map(|opt| opt.option_id.clone());
+    //!         // Auto-approve (YOLO mode) by option `kind`, never by position
+    //!         // or name: the agent decides which options exist and in what order.
+    //!         let allow = req.options.iter().find(|option| {
+    //!             matches!(
+    //!                 option.kind,
+    //!                 PermissionOptionKind::AllowOnce | PermissionOptionKind::AllowAlways
+    //!             )
+    //!         });
     //!         responder.respond(RequestPermissionResponse::new(
-    //!             match option_id {
-    //!                 Some(id) => RequestPermissionOutcome::Selected(
-    //!                     SelectedPermissionOutcome::new(id),
+    //!             match allow {
+    //!                 Some(option) => RequestPermissionOutcome::Selected(
+    //!                     SelectedPermissionOutcome::new(option.option_id.clone()),
     //!                 ),
     //!                 None => RequestPermissionOutcome::Cancelled,
     //!             }
@@ -731,8 +751,10 @@ pub mod global_mcp_server {
     //! let mcp_server = McpServer::<Conductor, _>::from_rmcp("my-server", MyMcpServer::new);
     //! ```
     //!
-    //! The `from_rmcp` function takes a factory closure that creates a new server
-    //! instance. This allows each MCP connection to get a fresh server instance.
+    //! The `from_rmcp` factory initializes one reusable application service lazily
+    //! for native ACP requests. Standalone MCP connections retain per-connection
+    //! construction. Each native operation has its own logical ID, metadata,
+    //! notifications, and cancellation lifetime.
     //!
     //! # How it works
     //!
@@ -746,7 +768,8 @@ pub mod global_mcp_server {
     //!    `session/new`, `session/resume`, and feature-gated `session/fork`
     //!    while preserving unrelated request fields
     //! 2. Passes the modified request through to the next handler
-    //! 3. Handles `mcp/connect`, `mcp/message`, and `mcp/disconnect` for that server ID
+    //! 3. Handles independent `mcp/message` operations for that server ID, without
+    //!    an initialization prerequisite or connect/disconnect exchange
     //!
     //! [`McpServer::builder`]: agent_client_protocol_rmcp::McpServerExt::builder
     //! [`McpServer::from_rmcp`]: agent_client_protocol_rmcp::McpServerExt::from_rmcp
