@@ -357,7 +357,6 @@ impl BoundedSender {
         self.budget.limits
     }
     /// Resolve when any admission/serialization failure makes this channel terminal.
-    #[must_use]
     pub fn failure(&self) -> BoxFuture<'static, Error> {
         self.budget.failure()
     }
