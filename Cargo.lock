@@ -158,6 +158,8 @@ dependencies = [
 [[package]]
 name = "agentkit-acp-schema"
 version = "1.19.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a65281699b3b868acddfe880ffd65c2b7e414554413dbb308fe6791cd12d1b23"
 dependencies = [
  "anyhow",
  "derive_more",
