@@ -22,13 +22,13 @@ pr_labels = ["release"]
 
 # Override the default tag format for the original crate to preserve existing tag history
 [[package]]
-name = "agent-client-protocol"
+name = "agentkit-acp-sdk"
 git_tag_name = "v{{ version }}"
 git_release_latest = true
 version_group = "acp"
 
 [[package]]
-name = "agent-client-protocol-http"
+name = "agentkit-acp-http"
 version_group = "acp"
 
 [[package]]

@@ -6,7 +6,77 @@ use crate::RawJsonRpcId;
 use crate::jsonrpc::protocol_compat::ProtocolCompat;
 use crate::jsonrpc::{OutgoingMessage, PendingReplies, RawJsonRpcMessage, TransportFrame};
 
-pub type OutgoingMessageTx = mpsc::UnboundedSender<OutgoingMessage>;
+use crate::bounded::TransportSender;
+use std::sync::Arc;
+
+#[derive(Clone, Debug)]
+pub struct OutgoingMessageTx {
+    state: Arc<OutgoingMessageState>,
+}
+#[derive(Debug)]
+struct OutgoingMessageState {
+    tx: mpsc::UnboundedSender<OutgoingMessage>,
+    budget: Option<crate::bounded::Budget>,
+}
+impl From<mpsc::UnboundedSender<OutgoingMessage>> for OutgoingMessageTx {
+    fn from(tx: mpsc::UnboundedSender<OutgoingMessage>) -> Self {
+        Self {
+            state: Arc::new(OutgoingMessageState { tx, budget: None }),
+        }
+    }
+}
+impl OutgoingMessageTx {
+    pub(super) fn budget(&self) -> Option<&crate::bounded::Budget> {
+        self.state.budget.as_ref()
+    }
+    pub(super) fn set_budget(&mut self, budget: Option<crate::bounded::Budget>) {
+        Arc::get_mut(&mut self.state)
+            .expect("configure sender before cloning")
+            .budget = budget;
+    }
+    pub(super) fn reserve(&self) -> Result<Option<crate::bounded::Charge>, crate::Error> {
+        self.state
+            .budget
+            .as_ref()
+            .map(crate::bounded::Budget::reserve_protocol)
+            .transpose()
+    }
+    pub(super) fn unbounded_send(&self, message: OutgoingMessage) -> Result<(), crate::Error> {
+        if matches!(message, OutgoingMessage::CloseAfterDraining { .. }) {
+            return self
+                .state
+                .tx
+                .unbounded_send(message)
+                .map_err(crate::util::internal_error);
+        }
+        self.send_with_charge(message, self.reserve()?)
+    }
+    pub(super) fn send_with_charge(
+        &self,
+        mut message: OutgoingMessage,
+        charge: Option<crate::bounded::Charge>,
+    ) -> Result<(), crate::Error> {
+        if let Some(budget) = &self.state.budget {
+            budget.check_admission()?;
+            let charge = charge.expect("bounded producers reserve before conversion");
+            message
+                .normalize(budget)
+                .map_err(|_| budget.fail("outgoing protocol message exceeds bounded limit"))?;
+            self.state
+                .tx
+                .unbounded_send(OutgoingMessage::Admitted {
+                    message: Box::new(message),
+                    charge,
+                })
+                .map_err(crate::util::internal_error)
+        } else {
+            self.state
+                .tx
+                .unbounded_send(message)
+                .map_err(crate::util::internal_error)
+        }
+    }
+}
 
 pub(crate) fn send_raw_message(
     tx: &OutgoingMessageTx,
@@ -15,7 +85,6 @@ pub(crate) fn send_raw_message(
     let (kind, method, id) = message.log_summary();
     tracing::debug!(kind, method, ?id, ?tx, "send_raw_message");
     tx.unbounded_send(message)
-        .map_err(crate::util::internal_error)
 }
 
 /// Outgoing protocol actor: Converts application-level OutgoingMessage to protocol-level RawJsonRpcMessage.
@@ -28,21 +97,28 @@ pub(crate) fn send_raw_message(
 pub(super) async fn outgoing_protocol_actor(
     mut outgoing_rx: mpsc::UnboundedReceiver<OutgoingMessage>,
     pending_replies: PendingReplies,
-    transport_tx: mpsc::UnboundedSender<TransportFrame>,
+    transport_tx: impl Into<TransportSender>,
     protocol_compat: ProtocolCompat,
     foreground_done: super::SharedCompletionSignal,
 ) -> Result<(), crate::Error> {
+    let transport_tx = transport_tx.into();
     let mut drain_waiters = Vec::new();
 
     while let Some(message) = outgoing_rx.next().await {
+        let (message, mut charge) = match message {
+            OutgoingMessage::Admitted { message, charge } => (*message, Some(charge)),
+            message => (message, None),
+        };
         let (kind, method, id) = message.log_summary();
         tracing::debug!(kind, method, ?id, "outgoing_protocol_actor");
 
         // Create the message to be sent over the transport
         let (json_rpc_message, destination) = match message {
+            OutgoingMessage::Admitted { .. } => unreachable!("nested admission"),
             OutgoingMessage::CloseAfterDraining { done } => {
                 // Reject later sends while preserving every message that was
                 // already accepted into this receiver's buffer.
+                transport_tx.close_protocol();
                 outgoing_rx.close();
                 drain_waiters.push(done);
                 continue;
@@ -115,8 +191,10 @@ pub(super) async fn outgoing_protocol_actor(
                     continue;
                 }
 
-                if let Err(error) = transport_tx.unbounded_send(TransportFrame::Single(request)) {
-                    let error = crate::Error::into_internal_error(error);
+                if let Err(error) = transport_tx.send(
+                    TransportFrame::Single(request),
+                    charge.take().into_iter().collect(),
+                ) {
                     if let Some(pending_reply) = pending_replies.remove(&id) {
                         pending_reply.fail(error.clone());
                     }
@@ -147,9 +225,10 @@ pub(super) async fn outgoing_protocol_actor(
                             continue;
                         }
                     };
-                    transport_tx
-                        .unbounded_send(TransportFrame::Single(message))
-                        .map_err(crate::Error::into_internal_error)?;
+                    transport_tx.send(
+                        TransportFrame::Single(message),
+                        charge.take().into_iter().collect(),
+                    )?;
                 }
                 continue;
             }
@@ -179,16 +258,14 @@ pub(super) async fn outgoing_protocol_actor(
         };
 
         if let Some(frame) = destination.complete(json_rpc_message) {
-            transport_tx
-                .unbounded_send(frame)
-                .map_err(crate::Error::into_internal_error)?;
+            transport_tx.send(frame, charge.take().into_iter().collect())?;
         }
     }
 
     // Closing the raw queue lets the transport actor finish all buffered
     // writes. The caller separately awaits that transport future before
     // treating the drain as complete.
-    drop(transport_tx);
+    transport_tx.finish();
     for done in drain_waiters {
         let _ = done.send(());
     }

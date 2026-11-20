@@ -151,7 +151,7 @@ pub(crate) async fn handle_post(
 }
 
 /// A `400 Bad Request` carrying the JSON-RPC error for a batch array.
-fn batch_rejection(frame: &TransportFrame) -> Option<Response> {
+pub(crate) fn batch_rejection(frame: &TransportFrame) -> Option<Response> {
     let body = crate::protocol::batch_rejection(frame)?;
     Some(
         (
@@ -163,7 +163,7 @@ fn batch_rejection(frame: &TransportFrame) -> Option<Response> {
     )
 }
 
-fn initial_initialize_request(frame: &TransportFrame) -> Option<&RawJsonRpcId> {
+pub(crate) fn initial_initialize_request(frame: &TransportFrame) -> Option<&RawJsonRpcId> {
     let TransportFrame::Single(message) = frame else {
         return None;
     };
@@ -176,7 +176,7 @@ fn initial_initialize_request(frame: &TransportFrame) -> Option<&RawJsonRpcId> {
     Some(&request.id)
 }
 
-fn initialize_response_failed(
+pub(crate) fn initialize_response_failed(
     frame: &TransportFrame,
     initialize_id: &RawJsonRpcId,
 ) -> Option<bool> {
@@ -201,7 +201,7 @@ fn initialize_response_failed(
     }
 }
 
-fn prepare_message_route(
+pub(crate) fn prepare_message_route(
     message: &mut RawJsonRpcMessage,
     session_id: Option<&str>,
 ) -> Result<Option<ResponseRoute>, &'static str> {

@@ -26,9 +26,9 @@ repository = "https://github.com/agentclientprotocol/rust-sdk"
 
 [workspace.dependencies]
 # Internal crates
-agent-client-protocol = { path = "src/agent-client-protocol", version = "5.4.0" }
+agent-client-protocol = { package = "agentkit-acp-sdk", path = "src/agent-client-protocol", version = "=5.4.0" }
 # Exact pin: the derive output calls `agent_client_protocol::__private`, which
-# only matches the derive crate released with the same core version.
+# matches the published upstream derive at the fork’s 5.4.0 base.
 agent-client-protocol-derive = { path = "src/agent-client-protocol-derive", version = "=5.4.0" }
 agent-client-protocol-polyfill = { path = "src/agent-client-protocol-polyfill", version = "5.4.0" }
 agent-client-protocol-rmcp = { path = "src/agent-client-protocol-rmcp", version = "5.4.0" }
@@ -37,7 +37,7 @@ agent-client-protocol-trace-viewer = { path = "src/agent-client-protocol-trace-v
 yopo = { package = "agent-client-protocol-yopo", path = "src/yopo" }
 
 # Protocol
-agent-client-protocol-schema = { version = "=1.19.0", default-features = false }
+agent-client-protocol-schema = { package = "agentkit-acp-schema", version = "=1.19.0", default-features = false }
 
 # Core async runtime
 tokio = { version = "1.52", default-features = false }

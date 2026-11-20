@@ -55,6 +55,25 @@ impl FinishControl {
             hook();
         }
     }
+
+    // Both the normal drain and bounded failure paths may request finish. Take
+    // the one-shot control while locked, then run adapter code without the lock.
+    pub(crate) fn split(self) -> (Self, Self) {
+        let control = std::sync::Arc::new(std::sync::Mutex::new(Some(self)));
+        let shared = control.clone();
+        let handle = |control: std::sync::Arc<std::sync::Mutex<Option<Self>>>| {
+            Self::new(move || {
+                let control = control
+                    .lock()
+                    .expect("finish control mutex poisoned")
+                    .take();
+                if let Some(mut control) = control {
+                    control.request();
+                }
+            })
+        };
+        (handle(control), handle(shared))
+    }
 }
 
 /// Drives owned endpoint work.
@@ -324,6 +343,28 @@ pub trait ConnectTo<R: Role>: Send + 'static {
         client: impl ConnectTo<R::Counterpart>,
     ) -> impl Future<Output = Result<()>> + Send;
 
+    /// Normalize an endpoint without losing opt-in bounded admission.
+    fn into_transport_and_future(self) -> (crate::TransportChannel, Option<ConnectionDriver>)
+    where
+        Self: Sized,
+    {
+        let (channel, driver) = self.into_channel_and_future();
+        (crate::TransportChannel::Legacy(channel), driver)
+    }
+
+    /// Connect through a bounded endpoint, without an unbounded adapter pump.
+    /// Legacy-only components report an error when they extract the endpoint.
+    fn into_bounded_channel_and_future(
+        self,
+        limits: crate::ChannelLimits,
+    ) -> Result<(crate::BoundedChannel, Option<ConnectionDriver>)>
+    where
+        Self: Sized,
+    {
+        let (channel, peer) = crate::BoundedChannel::duplex(limits)?;
+        Ok((channel, Some(ConnectionDriver::new(self.connect_to(peer)))))
+    }
+
     /// Convert this component into a channel endpoint and optional owned driver.
     ///
     /// The returned [`Channel`] is the canonical frame-aware boundary. It carries
@@ -396,6 +437,14 @@ trait ErasedConnectTo<R: Role>: Send {
         client: Box<dyn ErasedConnectTo<R::Counterpart>>,
     ) -> BoxFuture<'static, Result<()>>;
 
+    fn into_transport_and_future_erased(
+        self: Box<Self>,
+    ) -> (crate::TransportChannel, Option<ConnectionDriver>);
+    fn into_bounded_channel_and_future_erased(
+        self: Box<Self>,
+        limits: crate::ChannelLimits,
+    ) -> Result<(crate::BoundedChannel, Option<ConnectionDriver>)>;
+
     fn into_channel_and_future_erased(self: Box<Self>) -> (Channel, Option<ConnectionDriver>);
 }
 
@@ -417,6 +466,19 @@ impl<C: ConnectTo<R>, R: Role> ErasedConnectTo<R> for C {
                 })
                 .await
         })
+    }
+
+    fn into_transport_and_future_erased(
+        self: Box<Self>,
+    ) -> (crate::TransportChannel, Option<ConnectionDriver>) {
+        (*self).into_transport_and_future()
+    }
+
+    fn into_bounded_channel_and_future_erased(
+        self: Box<Self>,
+        limits: crate::ChannelLimits,
+    ) -> Result<(crate::BoundedChannel, Option<ConnectionDriver>)> {
+        (*self).into_bounded_channel_and_future(limits)
     }
 
     fn into_channel_and_future_erased(self: Box<Self>) -> (Channel, Option<ConnectionDriver>) {
@@ -471,6 +533,17 @@ impl<R: Role> ConnectTo<R> for DynConnectTo<R> {
         self.inner
             .connect_to_erased(Box::new(client) as Box<dyn ErasedConnectTo<R::Counterpart>>)
             .await
+    }
+
+    fn into_transport_and_future(self) -> (crate::TransportChannel, Option<ConnectionDriver>) {
+        self.inner.into_transport_and_future_erased()
+    }
+
+    fn into_bounded_channel_and_future(
+        self,
+        limits: crate::ChannelLimits,
+    ) -> Result<(crate::BoundedChannel, Option<ConnectionDriver>)> {
+        self.inner.into_bounded_channel_and_future_erased(limits)
     }
 
     fn into_channel_and_future(self) -> (Channel, Option<ConnectionDriver>) {

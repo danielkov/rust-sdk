@@ -192,8 +192,13 @@
 //!
 //! [`agent-client-protocol-conductor`]: https://crates.io/crates/agent-client-protocol-conductor
 
+mod bounded;
 /// Component abstraction for agents and proxies
 pub mod component;
+pub use bounded::{
+    BoundedChannel, BoundedReceiver, BoundedSender, ChannelLimits, ChargedFrame,
+    PreparedBoundedFrame, TransportChannel,
+};
 /// Core concepts for understanding and using agent-client-protocol
 pub mod concepts;
 /// JSON-RPC connection and handler infrastructure

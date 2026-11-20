@@ -39,6 +39,7 @@ impl<Counterpart: Role, H: HandleDispatchFrom<Counterpart>> DynHandleDispatchFro
 
 /// Messages used to add/remove dynamic handlers
 pub(crate) enum DynamicHandlerMessage<Counterpart: Role> {
+    Admitted(Box<Self>, crate::bounded::Charge),
     /// Registers a handler with the flag its guard clears on drop.
     AddDynamicHandler(
         Uuid,
@@ -56,6 +57,7 @@ pub(crate) enum DynamicHandlerMessage<Counterpart: Role> {
 impl<Counterpart: Role> std::fmt::Debug for DynamicHandlerMessage<Counterpart> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Admitted(message, _) => message.fmt(f),
             Self::AddDynamicHandler(arg0, arg1, _) => f
                 .debug_tuple("AddDynamicHandler")
                 .field(arg0)
@@ -67,5 +69,39 @@ impl<Counterpart: Role> std::fmt::Debug for DynamicHandlerMessage<Counterpart> {
             Self::Barrier => f.write_str("Barrier"),
             Self::AcknowledgedBarrier(_) => f.write_str("AcknowledgedBarrier"),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct DynamicHandlerTx<R: Role> {
+    tx: futures::channel::mpsc::UnboundedSender<DynamicHandlerMessage<R>>,
+    pub(super) budget: Option<crate::bounded::Budget>,
+}
+
+impl<R: Role> From<futures::channel::mpsc::UnboundedSender<DynamicHandlerMessage<R>>>
+    for DynamicHandlerTx<R>
+{
+    fn from(tx: futures::channel::mpsc::UnboundedSender<DynamicHandlerMessage<R>>) -> Self {
+        Self { tx, budget: None }
+    }
+}
+
+impl<R: Role> DynamicHandlerTx<R> {
+    pub(super) fn unbounded_send(
+        &self,
+        message: DynamicHandlerMessage<R>,
+    ) -> Result<(), crate::Error> {
+        let message = if let Some(budget) = &self.budget
+            && !matches!(
+                message,
+                DynamicHandlerMessage::Barrier | DynamicHandlerMessage::RemoveDynamicHandler(_)
+            ) {
+            DynamicHandlerMessage::Admitted(Box::new(message), budget.reserve()?)
+        } else {
+            message
+        };
+        self.tx
+            .unbounded_send(message)
+            .map_err(crate::util::internal_error)
     }
 }

@@ -74,7 +74,7 @@ struct PendingRoute {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SessionEffect {
+pub(crate) enum SessionEffect {
     None,
     /// A result names a new session in `sessionId` (`session/new`,
     /// `session/fork`).
@@ -85,7 +85,7 @@ enum SessionEffect {
 }
 
 impl SessionEffect {
-    fn for_method(method: &str) -> Self {
+    pub(crate) fn for_method(method: &str) -> Self {
         match method {
             "session/new" | "session/fork" => Self::Opens,
             "session/close" | "session/delete" => Self::Closes,

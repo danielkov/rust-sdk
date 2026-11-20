@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use agent_client_protocol::{
@@ -59,6 +62,10 @@ pub enum HttpClientError {
 #[derive(Debug, Error)]
 #[error(transparent)]
 pub struct InvalidUrlError(url::ParseError);
+
+#[path = "client_limits.rs"]
+mod limits;
+pub use limits::{BoundedHttpClient, HttpClientLimits};
 
 /// An endpoint-bound ACP transport using HTTP/SSE or WebSocket.
 ///
@@ -170,6 +177,16 @@ impl HttpClient {
             return Err(HttpClientError::WebSocketRequiresBuilder);
         }
         Ok(Self { endpoint, http })
+    }
+
+    /// Opt into fail-fast, bounded HTTP transport and core channel admission.
+    ///
+    /// This rejects WebSocket endpoints and does not retry POSTs or replay SSE.
+    ///
+    /// # Errors
+    /// Returns an error for invalid limits or a non-HTTP endpoint.
+    pub fn with_limits(self, limits: HttpClientLimits) -> Result<BoundedHttpClient, AcpError> {
+        BoundedHttpClient::new(self, limits)
     }
 
     fn is_websocket(&self) -> bool {
@@ -426,8 +443,10 @@ async fn run_with_finish(
                 let Some(event) = event else {
                     continue;
                 };
-                let open_session_ids = state.sessions_to_open_for_responses(&event.frame);
-                state.deliver_frame(event.frame);
+                let open_session_ids = match state.handle_sse_message(event) {
+                    Ok(open) => open,
+                    Err(error) => break Err(error),
+                };
                 for session_id in open_session_ids {
                     match lifecycle
                         .start_sse(
@@ -677,9 +696,21 @@ struct SseFailure {
     error: String,
 }
 
+#[derive(Debug, Default)]
+struct SseStream {
+    session_id: Option<String>,
+    // Shared only by events from this particular GET, not by a later GET
+    // for the same session ID.
+    expected_eof: AtomicBool,
+}
+
 #[derive(Debug)]
-struct SseMessage {
-    frame: TransportFrame,
+enum SseMessage {
+    Frame {
+        stream: Arc<SseStream>,
+        frame: TransportFrame,
+    },
+    Eof(Arc<SseStream>),
 }
 
 #[derive(Clone, Debug)]
@@ -849,8 +880,7 @@ impl HttpTransportLifecycle {
                 }
                 SseStartWait::Failure(failure) => return Err(sse_failure_error(failure)),
                 SseStartWait::SseEvent(Some(event)) => {
-                    let open_session_ids = state.sessions_to_open_for_responses(&event.frame);
-                    state.deliver_frame(event.frame);
+                    let open_session_ids = state.handle_sse_message(event)?;
                     for session_id in open_session_ids {
                         establishing.push(self.begin_sse(Some(session_id), event_tx.clone()));
                     }
@@ -913,38 +943,44 @@ fn run_sse(
     session_id: Option<String>,
     event_tx: UnboundedSender<SseMessage>,
     established_tx: futures::channel::oneshot::Sender<()>,
-) -> BoxFuture<'static, SseFailure> {
+) -> BoxFuture<'static, Option<SseFailure>> {
     Box::pin(async move {
-        let label = session_id.clone();
-        let error = match read_sse(connection, session_id, event_tx, established_tx).await {
-            Ok(()) => "SSE stream closed".to_string(),
-            Err(e) => e,
-        };
-        warn!(session_scoped = label.is_some(), "SSE stream ended");
-        SseFailure {
-            session_id: label,
-            error,
+        let stream = Arc::new(SseStream {
+            session_id,
+            ..SseStream::default()
+        });
+        match read_sse(connection, &stream, &event_tx, established_tx).await {
+            Ok(()) => {
+                // EOF shares the frame queue, so it cannot overtake the close
+                // response even if both arrived in the same HTTP body poll.
+                drop(event_tx.unbounded_send(SseMessage::Eof(stream)));
+                None
+            }
+            Err(error) => Some(SseFailure {
+                session_id: stream.session_id.clone(),
+                error,
+            }),
         }
     })
 }
 
 #[derive(Debug, Default)]
 struct SseTasks {
-    handles: FuturesUnordered<BoxFuture<'static, SseFailure>>,
+    handles: FuturesUnordered<BoxFuture<'static, Option<SseFailure>>>,
 }
 
 impl SseTasks {
-    fn push(&mut self, task: BoxFuture<'static, SseFailure>) {
+    fn push(&mut self, task: BoxFuture<'static, Option<SseFailure>>) {
         self.handles.push(task);
     }
 
     async fn next_failure(&mut self) -> SseFailure {
-        loop {
-            if let Some(failure) = self.handles.next().await {
+        while let Some(outcome) = self.handles.next().await {
+            if let Some(failure) = outcome {
                 return failure;
             }
-            futures::future::pending::<()>().await;
         }
+        futures::future::pending().await
     }
 
     fn abort_all(&mut self) {
@@ -955,12 +991,12 @@ impl SseTasks {
 struct ClientState {
     connection: HttpConnection,
     open_session_streams: HashSet<String>,
-    pending_requests: HashMap<RawJsonRpcId, VecDeque<String>>,
+    pending_requests: HashMap<RawJsonRpcId, VecDeque<RequestRoute>>,
     incoming: futures::channel::mpsc::UnboundedSender<TransportFrame>,
 }
 
 struct PendingPost {
-    pending_requests: Vec<(RawJsonRpcId, String)>,
+    pending_requests: Vec<(RawJsonRpcId, RequestRoute)>,
     response: BoxFuture<'static, Result<(), String>>,
 }
 
@@ -982,7 +1018,7 @@ impl PendingPost {
 
 #[derive(Debug)]
 struct CompletedPost {
-    pending_requests: Vec<(RawJsonRpcId, String)>,
+    pending_requests: Vec<(RawJsonRpcId, RequestRoute)>,
     result: Result<(), String>,
 }
 
@@ -1167,7 +1203,7 @@ impl ClientState {
         ))
     }
 
-    fn track_pending_requests(&mut self, pending_requests: &[(RawJsonRpcId, String)]) {
+    fn track_pending_requests(&mut self, pending_requests: &[(RawJsonRpcId, RequestRoute)]) {
         for (id, method) in pending_requests {
             self.pending_requests
                 .entry(id.clone())
@@ -1176,7 +1212,7 @@ impl ClientState {
         }
     }
 
-    fn remove_pending_requests(&mut self, pending_requests: &[(RawJsonRpcId, String)]) {
+    fn remove_pending_requests(&mut self, pending_requests: &[(RawJsonRpcId, RequestRoute)]) {
         for (id, method) in pending_requests.iter().rev() {
             let remove_entry = self.pending_requests.get_mut(id).is_some_and(|methods| {
                 if let Some(index) = methods.iter().rposition(|candidate| candidate == method) {
@@ -1190,7 +1226,7 @@ impl ClientState {
         }
     }
 
-    fn take_pending_request_method(&mut self, id: &RawJsonRpcId) -> Option<String> {
+    fn take_pending_request(&mut self, id: &RawJsonRpcId) -> Option<RequestRoute> {
         let (method, remove_entry) = {
             let methods = self.pending_requests.get_mut(id)?;
             (methods.pop_front(), methods.is_empty())
@@ -1211,10 +1247,31 @@ impl ClientState {
             .collect()
     }
 
-    fn sessions_to_open_for_responses(&mut self, frame: &TransportFrame) -> Vec<String> {
+    fn handle_sse_message(&mut self, event: SseMessage) -> Result<Vec<String>, AcpError> {
+        match event {
+            SseMessage::Frame { stream, frame } => {
+                let open = self.sessions_to_open_for_responses(&frame, &stream);
+                self.deliver_frame(frame);
+                Ok(open)
+            }
+            SseMessage::Eof(stream) if stream.expected_eof.load(Ordering::Relaxed) => {
+                Ok(Vec::new())
+            }
+            SseMessage::Eof(stream) => Err(sse_failure_error(SseFailure {
+                session_id: stream.session_id.clone(),
+                error: "SSE stream closed".to_owned(),
+            })),
+        }
+    }
+
+    fn sessions_to_open_for_responses(
+        &mut self,
+        frame: &TransportFrame,
+        stream: &SseStream,
+    ) -> Vec<String> {
         match frame {
             TransportFrame::Single(message) => self
-                .session_to_open_for_response(message)
+                .session_to_open_for_response(message, stream)
                 .into_iter()
                 .collect(),
             // Malformed and any other non-message frames open no sessions.
@@ -1222,19 +1279,30 @@ impl ClientState {
         }
     }
 
-    fn session_to_open_for_response(&mut self, msg: &RawJsonRpcMessage) -> Option<String> {
+    fn session_to_open_for_response(
+        &mut self,
+        msg: &RawJsonRpcMessage,
+        stream: &SseStream,
+    ) -> Option<String> {
         let RawJsonRpcMessage::Response(response) = msg else {
             return None;
         };
         let id = msg.response_id().and_then(pending_request_key)?;
-        let method = self.take_pending_request_method(&id);
-
-        if !method.as_deref().is_some_and(is_session_opening_method) {
-            return None;
-        }
+        let route = self.take_pending_request(&id)?;
         let RpcResponse::Result { result, .. } = response else {
             return None;
         };
+        if let Some(closing) = route.closing_session
+            && stream.session_id.as_deref() == Some(closing.as_str())
+        {
+            stream.expected_eof.store(true, Ordering::Relaxed);
+            // A caller may immediately resume from the close response, before
+            // the old GET's EOF is processed. Leave only the old GET's marker.
+            self.open_session_streams.remove(&closing);
+        }
+        if !is_session_opening_method(&route.method) {
+            return None;
+        }
         let session_id = result
             .get("sessionId")
             .and_then(|v| v.as_str())
@@ -1261,7 +1329,7 @@ impl ClientState {
 #[derive(Default)]
 struct FrameBookkeeping {
     session_ids: Vec<String>,
-    pending_requests: Vec<(RawJsonRpcId, String)>,
+    pending_requests: Vec<(RawJsonRpcId, RequestRoute)>,
 }
 
 impl FrameBookkeeping {
@@ -1304,8 +1372,8 @@ fn is_session_opening_method(method: &str) -> bool {
 
 async fn read_sse(
     connection: HttpConnection,
-    session_id: Option<String>,
-    event_tx: UnboundedSender<SseMessage>,
+    stream: &Arc<SseStream>,
+    event_tx: &UnboundedSender<SseMessage>,
     established_tx: futures::channel::oneshot::Sender<()>,
 ) -> Result<(), String> {
     let connection_id = connection
@@ -1315,7 +1383,7 @@ async fn read_sse(
         .get()
         .header("Accept", "text/event-stream")
         .header(HEADER_CONNECTION_ID, connection_id);
-    if let Some(session_id) = &session_id {
+    if let Some(session_id) = &stream.session_id {
         request = request.header(HEADER_SESSION_ID, session_id);
     }
 
@@ -1323,7 +1391,10 @@ async fn read_sse(
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    trace!(session_scoped = session_id.is_some(), "SSE stream open");
+    trace!(
+        session_scoped = stream.session_id.is_some(),
+        "SSE stream open"
+    );
     let _ = established_tx.send(());
 
     let mut events = eventsource_stream::EventStream::new(response.bytes_stream());
@@ -1335,18 +1406,42 @@ async fn read_sse(
         }
         let frame = TransportFrame::parse_json(&payload);
 
-        if event_tx.unbounded_send(SseMessage { frame }).is_err() {
+        if event_tx
+            .unbounded_send(SseMessage::Frame {
+                stream: stream.clone(),
+                frame,
+            })
+            .is_err()
+        {
             return Err("upstream channel closed".to_string());
         }
     }
     Ok(())
 }
 
-fn pending_request_for_message(msg: &RawJsonRpcMessage) -> Option<(RawJsonRpcId, String)> {
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequestRoute {
+    method: String,
+    closing_session: Option<String>,
+}
+
+fn pending_request_for_message(msg: &RawJsonRpcMessage) -> Option<(RawJsonRpcId, RequestRoute)> {
     let RawJsonRpcMessage::Request(request) = msg else {
         return None;
     };
-    pending_request_key(&request.id).map(|id| (id, request.method.to_string()))
+    let id = pending_request_key(&request.id)?;
+    let closing_session = if matches!(request.method.as_ref(), "session/close" | "session/delete") {
+        session_id_from_message(msg)
+    } else {
+        None
+    };
+    Some((
+        id,
+        RequestRoute {
+            method: request.method.to_string(),
+            closing_session,
+        },
+    ))
 }
 
 fn pending_request_key(id: &RawJsonRpcId) -> Option<RawJsonRpcId> {
@@ -2916,7 +3011,13 @@ mod tests {
             pending_requests: HashMap::new(),
             incoming,
         };
-        let pending_request = (RawJsonRpcId::Number(7), "custom/earlier".to_string());
+        let pending_request = (
+            RawJsonRpcId::Number(7),
+            RequestRoute {
+                method: "custom/earlier".to_string(),
+                closing_session: None,
+            },
+        );
         state.track_pending_requests(std::slice::from_ref(&pending_request));
         let mut posts = PostQueues::default();
         posts.ordered.push(PendingPost {
@@ -3012,7 +3113,8 @@ mod tests {
         let mut buffered_outgoing = VecDeque::new();
         let (event_tx, mut event_rx) = mpsc::unbounded();
         event_tx
-            .unbounded_send(SseMessage {
+            .unbounded_send(SseMessage::Frame {
+                stream: Arc::new(SseStream::default()),
                 frame: single_frame(
                     RawJsonRpcMessage::request(
                         "test/callback".to_string(),
@@ -3363,6 +3465,65 @@ mod tests {
         assert_eq!(delete_count.load(Ordering::SeqCst), 1);
 
         server.abort();
+    }
+
+    #[test]
+    fn session_eof_requires_a_matching_success_on_that_stream() {
+        for (stream_session, success, expected) in [
+            (Some("closing"), true, true),
+            (Some("closing"), false, false),
+            (Some("other"), true, false),
+            (None, true, false),
+        ] {
+            let (incoming, _rx) = mpsc::unbounded();
+            let mut state = ClientState {
+                connection: HttpConnection::new(
+                    url::Url::parse("http://localhost/acp").unwrap(),
+                    reqwest::Client::new(),
+                ),
+                open_session_streams: HashSet::from(["closing".into(), "other".into()]),
+                pending_requests: HashMap::new(),
+                incoming,
+            };
+            let TransportFrame::Single(request) = TransportFrame::parse_json(
+                r#"{"jsonrpc":"2.0","id":"close","method":"session/delete","params":{"sessionId":"closing"}}"#,
+            ) else {
+                panic!("request fixture")
+            };
+            state.track_pending_requests(&[pending_request_for_message(&request).unwrap()]);
+            let stream = Arc::new(SseStream {
+                session_id: stream_session.map(str::to_owned),
+                ..SseStream::default()
+            });
+            let frame = TransportFrame::parse_json(if success {
+                r#"{"jsonrpc":"2.0","id":"close","result":{}}"#
+            } else {
+                r#"{"jsonrpc":"2.0","id":"close","error":{"code":-32602,"message":"failed"}}"#
+            });
+            state
+                .handle_sse_message(SseMessage::Frame {
+                    stream: stream.clone(),
+                    frame,
+                })
+                .unwrap();
+            assert_eq!(state.open_session_streams.contains("closing"), !expected);
+            // A newly leased stream with the same ID does not inherit the old marker.
+            if expected {
+                let replacement = Arc::new(SseStream {
+                    session_id: stream.session_id.clone(),
+                    ..SseStream::default()
+                });
+                assert!(
+                    state
+                        .handle_sse_message(SseMessage::Eof(replacement))
+                        .is_err()
+                );
+            }
+            assert_eq!(
+                state.handle_sse_message(SseMessage::Eof(stream)).is_ok(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]

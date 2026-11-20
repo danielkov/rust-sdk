@@ -325,14 +325,12 @@ impl Serialize for RawJsonRpcMessage {
         S: serde::Serializer,
     {
         match self {
-            Self::Request(request) => {
-                VersionedJsonRpcMessage::wrap(request.clone()).serialize(serializer)
-            }
+            Self::Request(request) => VersionedJsonRpcMessage::wrap(request).serialize(serializer),
             Self::Notification(notification) => {
-                VersionedJsonRpcMessage::wrap(notification.clone()).serialize(serializer)
+                VersionedJsonRpcMessage::wrap(notification).serialize(serializer)
             }
             Self::Response(response) => {
-                VersionedJsonRpcMessage::wrap(response.clone()).serialize(serializer)
+                VersionedJsonRpcMessage::wrap(response).serialize(serializer)
             }
         }
     }
@@ -1769,11 +1767,19 @@ impl<
         // Normalize the transport without losing ownership or finish metadata.
         let transport_component = crate::DynConnectTo::new(transport);
         let (transport_channel, mut transport_future) =
-            transport_component.into_channel_and_future();
+            transport_component.into_transport_and_future();
+        let (mut transport_incoming_rx, transport_outgoing_tx, budget) = transport_channel.split();
         let owned_transport = transport_future.is_some();
         let transport_finish = transport_future
             .as_mut()
             .and_then(crate::ConnectionDriver::take_finish);
+        let (transport_finish, mut failed_transport_finish) = match transport_finish {
+            Some(finish) if budget.is_some() => {
+                let (normal, failure) = finish.split();
+                (Some(normal), Some(failure))
+            }
+            normal => (normal, None),
+        };
         let (transport_completion_tx, transport_completion_rx) = oneshot::channel();
         let transport_completion = transport_completion_rx
             .map(|result| {
@@ -1786,7 +1792,7 @@ impl<
             .boxed()
             .shared();
 
-        let connection = ConnectionTo::new(
+        let mut connection = ConnectionTo::new(
             me.counterpart(),
             outgoing_tx,
             new_task_tx,
@@ -1795,30 +1801,42 @@ impl<
             pending_replies.registrar(),
             protocol_mode,
         );
+        connection.message_tx.set_budget(budget.clone());
+        connection.task_tx.budget.clone_from(&budget);
+        connection.dynamic_handler_tx.budget.clone_from(&budget);
+        connection.pending_replies.budget.clone_from(&budget);
+        // If bounded admission fails, keep a cooperative transport's owned
+        // cleanup alive even if the protocol actors stop first.
+        let mut failed_transport_cleanup = None;
         // Transport progress must outlive successful foreground completion.
         // Application tasks remain cancellable. The inherited close-callback
         // phase still polls them for cleanup, but physical drain alone does not.
         let transport_driver = if let Some(driver) = transport_future {
+            // A terminal channel rejects new task admission, but an owned
+            // adapter already exists and must still run its cooperative cleanup.
+            let charge = budget.as_ref().and_then(|budget| budget.task().ok());
             let termination_sources = termination_sources.clone();
-            async move {
+            let work = async move {
+                let _charge = charge;
                 let result = driver.await;
                 termination_sources.record(TerminationSource::Transport, &result);
                 drop(transport_completion_tx.send(result.clone()));
                 result
             }
-            .boxed()
+            .boxed();
+            if budget.is_some() && transport_finish.is_some() {
+                let work = work.shared();
+                failed_transport_cleanup = Some(work.clone());
+                work.boxed()
+            } else {
+                work
+            }
         } else {
             // Channel-only endpoints have no physical sink work to await.
             // Their protocol drain marker still orders accepted output.
             drop(transport_completion_tx.send(Ok(())));
             future::ready(Ok(())).boxed()
         };
-
-        // Destructure the channel endpoints
-        let Channel {
-            rx: mut transport_incoming_rx,
-            tx: transport_outgoing_tx,
-        } = transport_channel;
 
         let transport_incoming = futures::stream::poll_fn({
             let mut completion = connection.transport_completion.clone();
@@ -1848,6 +1866,7 @@ impl<
             pending_replies: pending_replies.clone(),
         };
 
+        let mut bounded_lifetime = budget.clone().map(crate::bounded::DriverLifetime::new);
         let future = crate::util::instrument_with_connection_name(name, {
             let connection = connection.clone();
             async move {
@@ -1893,22 +1912,32 @@ impl<
                             }
                         };
                         let other_actors = async {
-                            let result = futures::try_join!(
-                                // A ready driver error is authoritative even if its
-                                // closed channel would also make output forwarding fail.
-                                transport_driver,
-                                // Protocol layer: OutgoingMessage -> RawJsonRpcMessage
-                                outgoing_actor::outgoing_protocol_actor(
-                                    outgoing_rx,
-                                    pending_replies,
-                                    transport_outgoing_tx,
-                                    protocol_compat,
-                                    foreground_done,
+                            let actors = async {
+                                futures::try_join!(
+                                    // A ready driver error is authoritative even if its
+                                    // closed channel would also make output forwarding fail.
+                                    transport_driver,
+                                    // Protocol layer: OutgoingMessage -> RawJsonRpcMessage
+                                    outgoing_actor::outgoing_protocol_actor(
+                                        outgoing_rx,
+                                        pending_replies,
+                                        transport_outgoing_tx,
+                                        protocol_compat,
+                                        foreground_done,
+                                    )
+                                    .inspect(|result| sources
+                                        .record(TerminationSource::Transport, result)),
                                 )
-                                .inspect(
-                                    |result| sources.record(TerminationSource::Transport, result)
-                                ),
-                            );
+                            };
+                            let result = if let Some(budget) = &budget {
+                                match future::select(Box::pin(actors), budget.failure()).await {
+                                    Either::Left((result, _)) => result,
+                                    Either::Right((error, _)) => Err(error),
+                                }
+                            } else {
+                                actors.await
+                            };
+                            sources.record(TerminationSource::Transport, &result);
                             // Signal before awaiting an underway close callback.
                             if result.is_err() {
                                 connection.request_shutdown();
@@ -1987,7 +2016,26 @@ impl<
                 };
                 // Every actor, handler, and task has completed or been
                 // dropped by the time `driver` resolves.
-                let result = driver.await;
+                let mut result = driver.await;
+                if let Some(budget) = &budget {
+                    if let Err(error) = budget.check() {
+                        let error = match failed_transport_cleanup {
+                            Some(cleanup) => {
+                                if let Some(finish) = &mut failed_transport_finish {
+                                    finish.request();
+                                }
+                                cleanup.await.err().unwrap_or(error)
+                            }
+                            None => result.err().unwrap_or(error),
+                        };
+                        sources.record(TerminationSource::Transport, &Err::<(), _>(error.clone()));
+                        result = Err(error);
+                    } else if result.is_ok()
+                        && let Some(lifetime) = &mut bounded_lifetime
+                    {
+                        lifetime.finish_gracefully();
+                    }
+                }
                 termination_guard.finish(match &result {
                     // A foreground that finishes after observing EOF still
                     // ended at a clean EOF boundary.
@@ -2127,6 +2175,7 @@ where
 /// Includes the response value and an optional ack channel for dispatch loop
 /// synchronization.
 pub(crate) struct ResponsePayload {
+    _charges: Vec<crate::bounded::Charge>,
     /// The response result - either the JSON value or an error.
     pub(crate) result: Result<serde_json::Value, crate::Error>,
 
@@ -2223,6 +2272,7 @@ impl PendingReply {
         if self
             .sender
             .send(ResponsePayload {
+                _charges: Vec::new(),
                 result: Err(error),
                 ack_tx: None,
             })
@@ -2254,6 +2304,7 @@ impl PendingReplies {
     fn registrar(&self) -> PendingRepliesRegistrar {
         PendingRepliesRegistrar {
             inner: Arc::downgrade(&self.inner),
+            budget: None,
         }
     }
 
@@ -2309,6 +2360,7 @@ impl PendingReplies {
 /// from extending the lifetime of response senders after the driver stops.
 #[derive(Clone)]
 struct PendingRepliesRegistrar {
+    budget: Option<crate::bounded::Budget>,
     inner: Weak<Mutex<PendingRepliesInner>>,
 }
 
@@ -2353,6 +2405,13 @@ impl PendingRepliesRegistrar {
                 Err((reply, None))
             } else if let Some(termination) = &inner.termination {
                 Err((reply, Some(termination.clone())))
+            } else if let Some(budget) = &self.budget
+                && inner.replies.len() >= budget.limits().max_pending_requests
+            {
+                drop(inner);
+                let error = budget.fail("bounded channel pending request admission exhausted");
+                reply.fail(error.clone());
+                return Err(error);
             } else {
                 Ok(inner.replies.insert(id, reply))
             }
@@ -2808,6 +2867,7 @@ pub fn is_cancel_request_notification<N: JsonRpcNotification>(notification: &N) 
 /// returns an error, that error is the response, not the generic fallback.
 #[derive(Clone, Debug, Default)]
 struct ResponseDestination {
+    _charges: Option<Arc<[crate::bounded::Charge]>>,
     state: Arc<ResponseDestinationState>,
 }
 
@@ -2870,8 +2930,16 @@ impl Drop for HandlerAttempt {
 }
 
 impl ResponseDestination {
+    #[cfg(test)]
     fn individual() -> Self {
         Self::default()
+    }
+
+    fn with_charges(charges: &[crate::bounded::Charge]) -> Self {
+        Self {
+            _charges: (!charges.is_empty()).then(|| Arc::from(charges)),
+            ..Self::default()
+        }
     }
 
     fn attempts(&self) -> std::sync::MutexGuard<'_, HandlerAttempts> {
@@ -2929,6 +2997,7 @@ struct RequestReplyTarget {
 
 #[derive(Clone)]
 struct ResponseReplyTarget {
+    charges: Vec<crate::bounded::Charge>,
     id: RawJsonRpcId,
     method: String,
     sender: Arc<Mutex<Option<oneshot::Sender<ResponsePayload>>>>,
@@ -2953,7 +3022,14 @@ impl ResponseReplyTarget {
         };
 
         let ack_tx = self.dispatch.acknowledgment(&self.ordering);
-        if sender.send(ResponsePayload { result, ack_tx }).is_err() {
+        if sender
+            .send(ResponsePayload {
+                result,
+                ack_tx,
+                _charges: self.charges,
+            })
+            .is_err()
+        {
             tracing::debug!(
                 method = %self.method,
                 id = ?self.id,
@@ -3017,6 +3093,10 @@ impl HandlerErrorTarget {
 
 #[derive(Debug)]
 enum OutgoingMessage {
+    Admitted {
+        message: Box<OutgoingMessage>,
+        charge: crate::bounded::Charge,
+    },
     /// Close the outgoing application queue and acknowledge after every
     /// already-accepted message has entered the raw transport queue.
     CloseAfterDraining { done: oneshot::Sender<()> },
@@ -3067,10 +3147,47 @@ enum OutgoingMessage {
 }
 
 impl OutgoingMessage {
+    fn normalize(&mut self, budget: &crate::bounded::Budget) -> Result<(), crate::Error> {
+        fn normalized<T: serde::de::DeserializeOwned>(
+            v: &impl Serialize,
+            limit: usize,
+        ) -> Result<T, crate::Error> {
+            let bytes = crate::bounded::serialize(v, limit)?;
+            Ok(serde_json::from_slice(&bytes)?)
+        }
+        let limit = budget.limits().max_frame_bytes;
+        match self {
+            Self::Request {
+                id,
+                method,
+                untyped,
+                ..
+            } => {
+                let values = normalized(&(&*id, &*method, &*untyped), limit)?;
+                (*id, *method, *untyped) = values;
+            }
+            Self::Notification { untyped } => *untyped = normalized(untyped, limit)?,
+            Self::Response {
+                id,
+                method,
+                response,
+                ..
+            } => {
+                let values = normalized(&(&*id, &*method, &*response), limit)?;
+                (*id, *method, *response) = values;
+            }
+            Self::UncorrelatedErrorResponse { error, .. } => *error = normalized(error, limit)?,
+            Self::CloseAfterDraining { .. } => {}
+            Self::Admitted { .. } => unreachable!("nested admission"),
+        }
+        Ok(())
+    }
+
     /// Kind, method, and ID only; params, results, and errors can carry
     /// credentials and must not appear in ordinary logs.
     fn log_summary(&self) -> (&'static str, Option<&str>, Option<&RawJsonRpcId>) {
         match self {
+            Self::Admitted { message, .. } => message.log_summary(),
             Self::CloseAfterDraining { .. } => ("close_after_draining", None, None),
             Self::Request { id, method, .. } => ("request", Some(method), Some(id)),
             Self::Notification { untyped } => ("notification", Some(&untyped.method), None),
@@ -3155,7 +3272,7 @@ pub struct ConnectionTo<Counterpart: Role> {
     counterpart: Counterpart,
     message_tx: OutgoingMessageTx,
     task_tx: TaskTx,
-    dynamic_handler_tx: mpsc::UnboundedSender<DynamicHandlerMessage<Counterpart>>,
+    dynamic_handler_tx: dynamic_handler::DynamicHandlerTx<Counterpart>,
     transport_completion: SharedTransportCompletion,
     pending_replies: PendingRepliesRegistrar,
     protocol_mode: ProtocolMode,
@@ -3481,9 +3598,9 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
     ) -> Self {
         Self {
             counterpart,
-            message_tx,
-            task_tx,
-            dynamic_handler_tx,
+            message_tx: message_tx.into(),
+            task_tx: task_tx.into(),
+            dynamic_handler_tx: dynamic_handler_tx.into(),
             transport_completion,
             pending_replies,
             protocol_mode,
@@ -3519,27 +3636,30 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
         &self,
         task: impl IntoFuture<Output = Result<(), crate::Error>, IntoFuture: Send + 'static>,
     ) -> Result<(), crate::Error> {
-        let mut state = self
-            .protected_operations
-            .lock()
-            .expect("protected operations mutex poisoned");
-        if state.joining.is_some() {
-            return Err(crate::Error::request_cancelled());
-        }
-        // Reap completed acknowledgments at admission, rather than retaining
-        // every operation for the entire lifetime of the connection.
-        state
-            .pending
-            .retain_mut(|done| matches!(done.try_recv(), Ok(None)));
-        let (done_tx, done_rx) = oneshot::channel();
         let task = task.into_future();
+        let (done_tx, done_rx) = oneshot::channel();
+        {
+            let mut state = self
+                .protected_operations
+                .lock()
+                .expect("protected operations mutex poisoned");
+            if state.joining.is_some() {
+                return Err(crate::Error::request_cancelled());
+            }
+            // Publish the acknowledgment before unlocking. Shutdown may start
+            // before enqueueing completes; on rejection the dropped sender
+            // still completes that acknowledgment. Do not wake the task or
+            // admission failure consumers while holding this lock.
+            state
+                .pending
+                .retain_mut(|done| matches!(done.try_recv(), Ok(None)));
+            state.pending.push(done_rx);
+        }
         self.spawn(async move {
             let result = task.await;
             let _ = done_tx.send(());
             result
-        })?;
-        state.pending.push(done_rx);
-        Ok(())
+        })
     }
 
     pub(crate) async fn wait_protected_operations(&self) {
@@ -4297,16 +4417,17 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
             original_method = notification.method(),
             "send_notification_to"
         );
+        let charge = self.message_tx.reserve()?;
         let transformed = remote_style.transform_outgoing_message(notification)?;
         tracing::debug!(
             transformed_method = %transformed.method,
             "send_notification_to transformed"
         );
-        send_raw_message(
-            &self.message_tx,
+        self.message_tx.send_with_charge(
             OutgoingMessage::Notification {
                 untyped: transformed,
             },
+            charge,
         )
     }
 
@@ -4365,6 +4486,11 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
         &self,
         handler: impl HandleDispatchFrom<Counterpart> + 'static,
     ) -> Result<DynamicHandlerGuard<Counterpart>, crate::Error> {
+        let charge = self
+            .message_tx
+            .budget()
+            .map(crate::bounded::Budget::task)
+            .transpose()?;
         let uuid = Uuid::new_v4();
         let active = Arc::new(AtomicBool::new(true));
         self.dynamic_handler_tx
@@ -4373,10 +4499,10 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
                 Box::new(GuardedDynamicHandler {
                     active: active.clone(),
                     handler,
+                    _charge: charge,
                 }),
                 active.clone(),
-            ))
-            .map_err(crate::util::internal_error)?;
+            ))?;
 
         Ok(DynamicHandlerGuard::new(uuid, active, self.clone()))
     }
@@ -4391,7 +4517,7 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
                     acknowledgment_tx,
                 ))
         {
-            return future::ready(Err(crate::Error::into_internal_error(error))).boxed();
+            return future::ready(Err(error)).boxed();
         }
 
         async move {
@@ -4415,6 +4541,7 @@ impl<Counterpart: Role> ConnectionTo<Counterpart> {
 
 struct GuardedDynamicHandler<Handler> {
     active: Arc<AtomicBool>,
+    _charge: Option<crate::bounded::Charge>,
     handler: Handler,
 }
 
@@ -4511,6 +4638,11 @@ impl<R: Role> Drop for DynamicHandlerGuard<R> {
         }
     }
 }
+
+type SendResponseFn<T> = Box<
+    dyn FnOnce(Result<T, crate::Error>, Option<crate::bounded::Charge>) -> Result<(), crate::Error>
+        + Send,
+>;
 
 /// The context to respond to an incoming request.
 ///
@@ -4613,7 +4745,7 @@ pub struct Responder<T: JsonRpcResponse = serde_json::Value, P: Protocol = Raw> 
     ///
     /// For incoming requests: serializes to JSON and sends over the wire.
     /// For incoming responses: sends to the waiting oneshot channel.
-    send_fn: Box<dyn FnOnce(Result<T, crate::Error>) -> Result<(), crate::Error> + Send>,
+    send_fn: SendResponseFn<T>,
 
     /// Answers the request with an error if no response is sent. Owns the
     /// request-local cancellation state, so it can still observe a
@@ -4720,15 +4852,15 @@ impl Responder<serde_json::Value, Raw> {
             method,
             id: HandleId::raw_layer(id),
             destination,
-            send_fn: Box::new(move |response: Result<serde_json::Value, crate::Error>| {
-                send_raw_message(
-                    &message_tx,
+            send_fn: Box::new(move |response, charge| {
+                message_tx.send_with_charge(
                     OutgoingMessage::Response {
                         id: id_clone,
                         method: method_clone,
                         response,
                         destination: send_destination,
                     },
+                    charge,
                 )
             }),
             drop_guard,
@@ -4823,9 +4955,9 @@ impl<T: JsonRpcResponse, P: Protocol> Responder<T, P> {
             method: self.method,
             id: self.id,
             destination: self.destination,
-            send_fn: Box::new(move |input: Result<U, crate::Error>| {
+            send_fn: Box::new(move |input, charge| {
                 let t_value = wrap_fn(&method, input);
-                send_fn(t_value)
+                send_fn(t_value, charge)
             }),
             drop_guard: self.drop_guard,
         }
@@ -4838,7 +4970,8 @@ impl<T: JsonRpcResponse, P: Protocol> Responder<T, P> {
     ) -> Result<(), crate::Error> {
         tracing::debug!(id = ?self.id, "respond called");
         self.drop_guard.disarm();
-        (self.send_fn)(response)
+        let charge = self.drop_guard.message_tx.reserve()?;
+        (self.send_fn)(response, charge)
     }
 
     /// Respond to the JSON-RPC request with a value.
@@ -4975,7 +5108,11 @@ impl ResponseRouter<serde_json::Value> {
     /// When [`route_with_result`](Self::route_with_result) is called, the response is sent through the oneshot
     /// channel to the code that originally sent the request. If that receiver was
     /// dropped, the response is discarded because there is no local awaiter left.
-    fn new(pending_reply: PendingReply, dispatch: ResponseDispatch) -> Self {
+    fn new(
+        pending_reply: PendingReply,
+        dispatch: ResponseDispatch,
+        charges: Vec<crate::bounded::Charge>,
+    ) -> Self {
         let PendingReply {
             id,
             method,
@@ -4987,6 +5124,7 @@ impl ResponseRouter<serde_json::Value> {
             accepts_lower_initialize_version: _,
         } = pending_reply;
         let reply_target = ResponseReplyTarget {
+            charges,
             id: id.clone(),
             method: method.clone(),
             sender: Arc::new(Mutex::new(Some(sender))),
@@ -5899,16 +6037,29 @@ impl RequestPublication {
         let id = id.clone();
         let method = method.clone();
         let cancellation_disarm = self.pending_reply.cancellation_disarm.clone();
+        let charge = match self.message_tx.reserve() {
+            Ok(charge) => charge,
+            Err(error) => {
+                self.pending_reply.fail(error.clone());
+                return Err(error);
+            }
+        };
         // Register before enqueueing so incoming EOF can fail every observable
         // request before close callbacks begin. The outgoing actor checks that
         // the registration still exists before sending the request.
         self.pending_replies
             .subscribe(id.clone(), self.pending_reply, &self.incoming_closed)?;
-        if self.message_tx.unbounded_send(message).is_err() {
+        if let Err(send_error) = self.message_tx.send_with_charge(message, charge) {
             let error = if self.incoming_closed.is_closing() {
                 incoming_transport_closed_error(&method)
             } else {
-                crate::util::internal_error(format!("failed to send outgoing request `{method}`"))
+                if self.message_tx.budget().is_some() {
+                    send_error
+                } else {
+                    crate::util::internal_error(format!(
+                        "failed to send outgoing request `{method}`"
+                    ))
+                }
             };
             if let Some(pending_reply) = self.pending_replies.remove(&id) {
                 pending_reply.fail(error.clone());
@@ -6408,7 +6559,7 @@ impl<P: Protocol> SentRequest<serde_json::Value, P> {
     fn new(
         id: HandleId<P>,
         method: String,
-        task_tx: mpsc::UnboundedSender<Task>,
+        task_tx: TaskTx,
         response_rx: oneshot::Receiver<ResponsePayload>,
         cancellation: SentRequestCancellation,
         response_ordering: ResponseOrdering,
@@ -6760,7 +6911,11 @@ impl<T, P: Protocol> SentRequest<T, P> {
             .await;
 
             match response {
-                Ok(ResponsePayload { result, ack_tx }) => {
+                Ok(ResponsePayload {
+                    result,
+                    ack_tx,
+                    _charges,
+                }) => {
                     let typed_result = to_result(result);
 
                     let outcome = handle(Ok(typed_result)).await;
@@ -6856,7 +7011,11 @@ impl<T, P: Protocol> SentRequest<T, P> {
         .await;
 
         match response {
-            Ok(ResponsePayload { result, ack_tx }) => {
+            Ok(ResponsePayload {
+                result,
+                ack_tx,
+                _charges,
+            }) => {
                 // Blocking consumers ack before converting or returning the
                 // value, so dispatch can continue while the caller processes it.
                 if let Some(tx) = ack_tx {
@@ -6890,7 +7049,11 @@ impl<T, P: Protocol> SentRequest<T, P> {
         .await;
 
         let (result, ack_tx) = match response {
-            Ok(ResponsePayload { result, ack_tx }) => ((self.to_result)(result), ack_tx),
+            Ok(ResponsePayload {
+                result,
+                ack_tx,
+                _charges,
+            }) => ((self.to_result)(result), ack_tx),
             Err(error) => (
                 Err(crate::util::internal_error(format!(
                     "response to `{}` never received: {error}",
@@ -7842,7 +8005,7 @@ mod tests {
         // The helper drops its task receiver, so use a live receiver for this probe.
         let (task_tx, mut task_rx) = mpsc::unbounded();
         let connection = ConnectionTo {
-            task_tx,
+            task_tx: task_tx.into(),
             ..connection
         };
         for _ in 0..100 {

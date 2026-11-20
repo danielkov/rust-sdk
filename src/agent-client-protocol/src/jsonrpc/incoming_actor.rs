@@ -12,13 +12,13 @@ use uuid::Uuid;
 
 use crate::Dispatch;
 use crate::UntypedMessage;
+use crate::bounded::{Charge, IncomingFrame};
 use crate::jsonrpc::ConnectionTo;
 use crate::jsonrpc::HandleConnectionClose;
 use crate::jsonrpc::HandleDispatchFrom;
 use crate::jsonrpc::HandlerErrorTarget;
 use crate::jsonrpc::OutgoingMessage;
 use crate::jsonrpc::PendingReplies;
-use crate::jsonrpc::PendingReply;
 use crate::jsonrpc::RawJsonRpcMessage;
 use crate::jsonrpc::RawJsonRpcParams;
 use crate::jsonrpc::RawJsonRpcResponse as Response;
@@ -71,7 +71,7 @@ impl<Message, Close> IncomingHandlers<Message, Close> {
 pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
     counterpart: Counterpart,
     connection: &ConnectionTo<Counterpart>,
-    transport_rx: impl futures::Stream<Item = TransportFrame>,
+    transport_rx: impl futures::Stream<Item = impl Into<IncomingFrame>>,
     dynamic_handler_rx: mpsc::UnboundedReceiver<DynamicHandlerMessage<Counterpart>>,
     pending_replies: PendingReplies,
     handlers: IncomingHandlers<
@@ -90,7 +90,7 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
     // transport EOF as an explicit event so the other, connection-internal
     // streams cannot hide it.
     let transport_with_close = futures::StreamExt::chain(
-        transport_rx.map(IncomingProtocolMsg::Transport),
+        transport_rx.map(|frame| IncomingProtocolMsg::Transport(frame.into())),
         stream::iter([IncomingProtocolMsg::TransportClosed]),
     );
     let my_rx =
@@ -129,6 +129,9 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
         tracing::trace!(event, actor = "incoming_protocol_actor");
         match message_result {
             IncomingProtocolMsg::TransportClosed => {
+                if let Some(budget) = connection.message_tx.budget() {
+                    budget.check()?;
+                }
                 connection.begin_incoming_close();
                 let pending_reply_count = pending_replies.close_incoming();
                 tracing::debug!(pending_reply_count, "Incoming transport closed");
@@ -154,7 +157,8 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
             }
 
             IncomingProtocolMsg::Transport(frame) => {
-                if let Some((message, destination)) = frame_entry(frame) {
+                let IncomingFrame { frame, charges } = frame;
+                if let Some((message, destination)) = frame_entry(frame, &charges) {
                     match message {
                         Ok(RawJsonRpcMessage::Request(request)) => {
                             tracing::trace!(method = %request.method, id = ?request.id, "Handling request");
@@ -177,6 +181,7 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
                                             counterpart.clone(),
                                             connection,
                                             dispatch,
+                                            &charges,
                                             &mut dynamic_handlers,
                                             &mut handler,
                                             &mut pending_messages,
@@ -217,6 +222,7 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
                                             counterpart.clone(),
                                             connection,
                                             dispatch,
+                                            &charges,
                                             &mut dynamic_handlers,
                                             &mut handler,
                                             &mut pending_messages,
@@ -244,11 +250,16 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
                                     result,
                                 );
                                 let (dispatch, response_dispatch) =
-                                    dispatch_from_response(pending_reply, result);
+                                    dispatch_from_response_with_charges(
+                                        pending_reply,
+                                        result,
+                                        charges,
+                                    );
                                 dispatch_dispatch(
                                     counterpart.clone(),
                                     connection,
                                     dispatch,
+                                    &[],
                                     &mut dynamic_handlers,
                                     &mut handler,
                                     &mut pending_messages,
@@ -264,8 +275,7 @@ pub(super) async fn incoming_protocol_actor<Counterpart: Role>(
                                     // preceding handler before dispatching the next transport entry.
                                     connection
                                         .dynamic_handler_tx
-                                        .unbounded_send(DynamicHandlerMessage::Barrier)
-                                        .map_err(crate::util::internal_error)?;
+                                        .unbounded_send(DynamicHandlerMessage::Barrier)?;
 
                                     loop {
                                         let Some(message) = my_rx.next().await else {
@@ -326,12 +336,18 @@ async fn handle_dynamic_handler_message<Counterpart: Role>(
     dynamic_handlers: &mut DynamicHandlers<Counterpart>,
     pending_messages: &mut ParkedMessages,
 ) -> Result<(), crate::Error> {
+    let (message, _charge) = match message {
+        DynamicHandlerMessage::Admitted(message, charge) => (*message, Some(charge)),
+        message => (message, None),
+    };
     match message {
+        DynamicHandlerMessage::Admitted(..) => unreachable!("nested admission"),
         DynamicHandlerMessage::AddDynamicHandler(uuid, mut handler, active) => {
             // Before adding the new handler, give it a chance to process
             // any pending messages.
             let mut new_pending_messages = VecDeque::new();
-            for (pending_message, reason) in std::mem::take(&mut pending_messages.messages) {
+            for (pending_message, reason, charges) in std::mem::take(&mut pending_messages.messages)
+            {
                 tracing::trace!(method = pending_message.method(), handler = ?handler.dyn_describe_chain(), "Retrying message");
                 let reply_target = pending_message.handler_error_target();
                 let method = pending_message.method().to_string();
@@ -352,7 +368,7 @@ async fn handle_dynamic_handler_message<Counterpart: Role>(
                         retry: _,
                     }) => {
                         tracing::trace!(method = m.method(), handler = ?handler.dyn_describe_chain(), "Message not handled");
-                        new_pending_messages.push_back((m, reason));
+                        new_pending_messages.push_back((m, reason, charges));
                     }
                     Err(err) => {
                         tracing::warn!(%method, err = ?crate::util::redacted_error(err.code), handler = ?handler.dyn_describe_chain(), "Dynamic handler errored on pending message");
@@ -382,7 +398,7 @@ async fn handle_dynamic_handler_message<Counterpart: Role>(
 
 #[derive(Debug)]
 enum IncomingProtocolMsg<Counterpart: Role> {
-    Transport(TransportFrame),
+    Transport(IncomingFrame),
     TransportClosed,
     DynamicHandler(DynamicHandlerMessage<Counterpart>),
 }
@@ -393,6 +409,7 @@ enum IncomingProtocolMsg<Counterpart: Role> {
 /// including an unsupported JSON-RPC batch array, is answered with its error.
 fn frame_entry(
     frame: TransportFrame,
+    charges: &[Charge],
 ) -> Option<(
     Result<RawJsonRpcMessage, crate::Error>,
     Option<ResponseDestination>,
@@ -400,11 +417,11 @@ fn frame_entry(
     match frame {
         TransportFrame::Single(message) => {
             let destination = matches!(&message, RawJsonRpcMessage::Request(_))
-                .then(ResponseDestination::individual);
+                .then(|| ResponseDestination::with_charges(charges));
             Some((Ok(message), destination))
         }
         TransportFrame::Malformed { raw, error } => (!raw_is_response_only_shape(&raw))
-            .then(|| (Err(error), Some(ResponseDestination::individual()))),
+            .then(|| (Err(error), Some(ResponseDestination::with_charges(charges)))),
     }
 }
 
@@ -452,14 +469,23 @@ fn dispatch_from_message<Counterpart: Role>(
 /// This allows handlers to intercept and process responses before they reach
 /// the awaiting code. The default behavior is to forward the response to the
 /// local awaiter via the oneshot channel.
+#[cfg(test)]
 pub(super) fn dispatch_from_response(
-    pending_reply: PendingReply,
+    pending_reply: super::PendingReply,
     result: Result<serde_json::Value, crate::Error>,
+) -> (Dispatch, ResponseDispatch) {
+    dispatch_from_response_with_charges(pending_reply, result, Vec::new())
+}
+
+fn dispatch_from_response_with_charges(
+    pending_reply: super::PendingReply,
+    result: Result<serde_json::Value, crate::Error>,
+    charges: Vec<Charge>,
 ) -> (Dispatch, ResponseDispatch) {
     let response_dispatch = ResponseDispatch::default();
 
     // Create a Dispatch::Response with a ResponseRouter that routes to the oneshot
-    let router = ResponseRouter::new(pending_reply, response_dispatch.clone());
+    let router = ResponseRouter::new(pending_reply, response_dispatch.clone(), charges);
     (Dispatch::Response(result, router), response_dispatch)
 }
 
@@ -472,6 +498,7 @@ async fn dispatch_dispatch<Counterpart: Role>(
     counterpart: Counterpart,
     connection: &ConnectionTo<Counterpart>,
     mut dispatch: Dispatch,
+    charges: &[Charge],
     dynamic_handlers: &mut DynamicHandlers<Counterpart>,
     handler: &mut impl HandleDispatchFrom<Counterpart>,
     pending_messages: &mut ParkedMessages,
@@ -614,7 +641,7 @@ async fn dispatch_dispatch<Counterpart: Role>(
                 ?method,
                 "Retrying message as new dynamic handlers are added"
             );
-            pending_messages.park(dispatch, reason)
+            pending_messages.park(dispatch, reason, charges)
         }
         None => reject_unhandled(dispatch),
     }
@@ -693,15 +720,20 @@ enum ParkReason {
 /// Messages waiting for a dynamic handler, oldest first.
 #[derive(Default)]
 struct ParkedMessages {
-    messages: VecDeque<(Dispatch, ParkReason)>,
+    messages: VecDeque<(Dispatch, ParkReason, Vec<Charge>)>,
 }
 
 impl ParkedMessages {
     /// Park a message, first answering or dropping the oldest one when the
     /// queue is full.
-    fn park(&mut self, dispatch: Dispatch, reason: ParkReason) -> Result<(), crate::Error> {
+    fn park(
+        &mut self,
+        dispatch: Dispatch,
+        reason: ParkReason,
+        charges: &[Charge],
+    ) -> Result<(), crate::Error> {
         if self.messages.len() >= MAX_PARKED_MESSAGES
-            && let Some((oldest, _)) = self.messages.pop_front()
+            && let Some((oldest, _, _charges)) = self.messages.pop_front()
         {
             tracing::warn!(
                 method = oldest.method(),
@@ -710,7 +742,8 @@ impl ParkedMessages {
             );
             reject_unhandled(oldest)?;
         }
-        self.messages.push_back((dispatch, reason));
+        self.messages
+            .push_back((dispatch, reason, charges.to_vec()));
         Ok(())
     }
 
@@ -724,16 +757,16 @@ impl ParkedMessages {
             || !self
                 .messages
                 .iter()
-                .any(|(_, reason)| *reason == ParkReason::AwaitingHandlerChange)
+                .any(|(_, reason, _)| *reason == ParkReason::AwaitingHandlerChange)
         {
             return Ok(());
         }
         let mut kept = VecDeque::with_capacity(self.messages.len());
-        for (dispatch, reason) in std::mem::take(&mut self.messages) {
+        for (dispatch, reason, charges) in std::mem::take(&mut self.messages) {
             if reason == ParkReason::AwaitingHandlerChange {
                 reject_unhandled(dispatch)?;
             } else {
-                kept.push_back((dispatch, reason));
+                kept.push_back((dispatch, reason, charges));
             }
         }
         self.messages = kept;

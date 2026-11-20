@@ -13,6 +13,10 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 
 use crate::connection::ConnectionRegistry;
 
+#[path = "bounded_server.rs"]
+mod bounded;
+pub use bounded::{BoundedAcpHttpServer, ServerLimits, ServerLimitsError};
+
 /// Configuration for an [`AcpHttpServer`].
 ///
 /// Start with [`Self::default`] and use the fluent setters to customize it.
@@ -295,6 +299,22 @@ impl std::fmt::Debug for AcpHttpServer {
 }
 
 impl AcpHttpServer {
+    /// Opt into finite HTTP/SSE admission using a bounded core transport factory.
+    /// WebSocket upgrades are rejected on this path; legacy constructors are unchanged.
+    ///
+    /// # Errors
+    /// Returns an error if the transport limits are invalid.
+    pub fn new_bounded<F, C>(
+        factory: F,
+        limits: ServerLimits,
+    ) -> Result<BoundedAcpHttpServer, ServerLimitsError>
+    where
+        F: Fn() -> C + Send + Sync + 'static,
+        C: ConnectTo<Client>,
+    {
+        BoundedAcpHttpServer::new(factory, limits)
+    }
+
     /// Create a server that calls `factory` once per ACP connection.
     ///
     /// The server starts with [`ServerOptions::default`].

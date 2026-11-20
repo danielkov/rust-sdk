@@ -1,14 +1,17 @@
 [package]
-name = "agent-client-protocol"
+name = "agentkit-acp-sdk"
 version = "5.4.0"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
-repository.workspace = true
-description = "Core protocol types and traits for the Agent Client Protocol"
+repository = "https://github.com/danielkov/rust-sdk"
+description = "Core Agent Client Protocol SDK fork with draft prompt delivery"
 keywords = ["acp", "agent", "protocol", "ai"]
 categories = ["development-tools"]
+
+[lib]
+name = "agent_client_protocol"
 
 [package.metadata.docs.rs]
 all-features = true
@@ -56,6 +59,7 @@ unstable = [
     "unstable_llm_providers",
     "unstable_mcp_over_acp",
     "unstable_plan_operations",
+    "unstable_prompt_delivery",
     "unstable_prompt_suggestions",
     "unstable_session_archive",
     "unstable_session_cursors",
@@ -72,6 +76,7 @@ unstable_end_turn_token_usage = ["agent-client-protocol-schema/unstable_end_turn
 unstable_llm_providers = ["agent-client-protocol-schema/unstable_llm_providers"]
 unstable_mcp_over_acp = ["agent-client-protocol-schema/unstable_mcp_over_acp"]
 unstable_plan_operations = ["agent-client-protocol-schema/unstable_plan_operations"]
+unstable_prompt_delivery = ["unstable_protocol_v2", "agent-client-protocol-schema/unstable_prompt_delivery"]
 unstable_prompt_suggestions = ["agent-client-protocol-schema/unstable_prompt_suggestions"]
 unstable_session_archive = ["agent-client-protocol-schema/unstable_session_archive"]
 unstable_session_cursors = ["agent-client-protocol-schema/unstable_session_cursors"]
